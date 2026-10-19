@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter, defaultdict
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1372,7 +1373,7 @@ def format_read_file_observation(path: str, text: str, included_tokens: int) -> 
 def token_prefix(text: str, max_tokens: int) -> str:
     if max_tokens <= 0:
         return ""
-    matches = list(TOKEN_RE.finditer(text))
+    matches = list(islice(TOKEN_RE.finditer(text), min(max_tokens + 1, len(text))))
     if len(matches) <= max_tokens:
         return text
     end = matches[max_tokens - 1].end()
