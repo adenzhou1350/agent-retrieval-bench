@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +19,52 @@ def write_jsonl(path, rows):
 
 
 class RepoMapEvalTests(unittest.TestCase):
+    def test_symbol_reference_cap_is_stable_across_hash_seeds(self):
+        code = """
+import json
+from agent_retrieval_bench.repomap_eval import build_repomap_index
+chunks = [
+    dict(path='caller.py', kind='file', text='alphaunique betaunique'),
+    dict(path='alpha.py', kind='file', text='def alphaunique(): pass'),
+    dict(path='alpha.py', kind='symbol', symbol='alphaunique'),
+    dict(path='beta.py', kind='file', text='def betaunique(): pass'),
+    dict(path='beta.py', kind='symbol', symbol='betaunique'),
+]
+index = build_repomap_index(chunks, max_symbol_refs_per_file=1)
+collision_chunks = [
+    dict(path='caller.py', kind='file', text='alphaunique betaunique'),
+    dict(path='symbols.py', kind='file', text=''),
+    dict(path='symbols.py', kind='symbol', symbol='alphaunique_betaunique'),
+    dict(path='symbols.py', kind='symbol', symbol='alphauniquebetaunique'),
+]
+collision = build_repomap_index(collision_chunks, max_symbol_refs_per_file=1)
+print(json.dumps(dict(capped=index.graph, normalized=collision.graph), sort_keys=True))
+"""
+        graphs = []
+        for seed in (0, 1, 3, 7):
+            with self.subTest(seed=seed):
+                output = subprocess.check_output(
+                    [sys.executable, "-B", "-c", code],
+                    env=dict(os.environ, PYTHONHASHSEED=str(seed)),
+                    text=True,
+                    timeout=10,
+                )
+                graph = json.loads(output)
+                self.assertEqual(graph["capped"]["caller.py"], {"alpha.py": 1.0})
+                graphs.append(graph)
+        self.assertTrue(all(graph == graphs[0] for graph in graphs))
+
+    def test_symbol_reference_cap_keeps_match_count_priority(self):
+        chunks = [
+            dict(path="caller.py", kind="file", text="alphaunique zebraunique omegalong"),
+            dict(path="alpha.py", kind="file", text="def alphaunique(): pass"),
+            dict(path="alpha.py", kind="symbol", symbol="alphaunique"),
+            dict(path="zebra.py", kind="file", text="def zebraunique_omegalong(): pass"),
+            dict(path="zebra.py", kind="symbol", symbol="zebraunique_omegalong"),
+        ]
+        index = build_repomap_index(chunks, max_symbol_refs_per_file=1)
+        self.assertEqual(index.graph["caller.py"], {"zebra.py": 1.0})
+
     def test_build_repomap_index_links_symbols_imports_and_tests(self):
         chunks = [
             {

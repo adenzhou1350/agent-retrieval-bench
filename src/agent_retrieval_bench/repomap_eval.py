@@ -309,7 +309,7 @@ def aggregate_file_nodes(chunks: list[dict[str, Any]]) -> dict[str, FileNode]:
 def compute_tokens_and_idf(nodes: dict[str, FileNode]) -> None:
     for node in nodes.values():
         node.path_tokens = set(tokenize(node.path.replace("/", " ").replace(".", " ").replace("_", " ")))
-        symbol_text = " ".join(node.symbols)
+        symbol_text = " ".join(sorted(node.symbols))
         node.symbol_tokens = set(tokenize(symbol_text))
         content_tokens = set(tokenize(node.text[:20_000]))
         node.token_set = node.path_tokens | node.symbol_tokens | content_tokens
@@ -342,17 +342,19 @@ def add_symbol_reference_edges(nodes: dict[str, FileNode], graph: dict[str, dict
     for path, node in nodes.items():
         if node.kind == "other":
             continue
-        for symbol in node.symbols:
+        for symbol in sorted(node.symbols):
             key = normalize_identifier(symbol)
             if key:
                 symbol_index[key].add(path)
     for path, node in nodes.items():
         if node.kind == "other":
             continue
-        for symbol in node.symbols:
+        for symbol in sorted(node.symbols):
             key = normalize_identifier(symbol)
             if not key or len(symbol_index[key]) > 8:
                 continue
+            # Different spellings can normalize to one key. Keep the chosen
+            # spelling's parts stable as well as the capped candidates below.
             parts = {token for token in tokenize(symbol) if len(token) >= 3 and token not in GENERIC_SYMBOLS}
             if not parts or (len(parts) == 1 and len(next(iter(parts))) < 8):
                 continue
@@ -369,7 +371,10 @@ def add_symbol_reference_edges(nodes: dict[str, FileNode], graph: dict[str, dict
         for token in node.token_set:
             for key in token_to_symbol_keys.get(token, set()):
                 candidate_keys[key] += 1
-        for key, matched_parts in candidate_keys.most_common(max_symbol_refs_per_file * 4):
+        # Counts can tie, and the contributing tokens/keys are sets. Resolve
+        # those ties before the reference cap rather than by hash iteration.
+        candidates = sorted(candidate_keys.items(), key=lambda item: (-item[1], item[0]))
+        for key, matched_parts in candidates[:max_symbol_refs_per_file * 4]:
             parts = symbol_parts.get(key)
             if not parts or matched_parts < len(parts):
                 continue
@@ -392,7 +397,7 @@ def add_source_test_edges(nodes: dict[str, FileNode], graph: dict[str, dict[str,
         keys = canonical_test_source_keys(path)
         if not keys:
             continue
-        for key in keys:
+        for key in sorted(keys):
             if node.kind == "test":
                 tests_by_key[key].append(path)
             elif node.kind == "source":
@@ -472,7 +477,7 @@ def compute_task_affinity(sample: dict[str, Any], query_text: str, index: RepoMa
     task_type = str(sample.get("task_type") or "")
     scores = {path: 0.0 for path in index.nodes}
     query_paths = paths_mentioned_by_query(sample, query_text, index.nodes.keys())
-    for path in query_paths:
+    for path in sorted(query_paths):
         scores[path] += 0.4
         for neighbor in index.graph.get(path, {}):
             scores[neighbor] += 1.0
