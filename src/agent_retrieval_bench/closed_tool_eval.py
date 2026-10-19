@@ -578,7 +578,8 @@ def run_closed_tool_sample(
                 "is_utilized_context": False,
             }
         )
-        content_bonus = len(query_tokens & tokenize(text[:20_000])) / max(1, len(query_tokens))
+        visible_text = token_prefix(text, included_tokens)
+        content_bonus = len(query_tokens & tokenize(visible_text[:20_000])) / max(1, len(query_tokens))
         candidate_scores[path] += content_bonus
         trace.append(
             {
