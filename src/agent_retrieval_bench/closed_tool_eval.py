@@ -21,7 +21,7 @@ from .baseline import (
     supporting_context_files,
     target_gold_files,
 )
-from .bcy_curve import count_tokens
+from .bcy_curve import TOKEN_RE, count_tokens
 from .curate import filter_samples, load_keep_ids
 from .io import ensure_parent, read_jsonl, utc_now, write_json
 from .trajectory import summarize_trajectory_details, trajectory_detail, write_jsonl
@@ -44,7 +44,6 @@ DEFAULT_SEED_INTERVENTION_REPORT = Path("data/reports/v1_4/closed_tool_seed_inte
 DEFAULT_CODEX_BIN = Path(os.environ.get("CODEX_BIN", "/home/ubuntu/.nvm/versions/node/v22.22.0/bin/codex"))
 DEFAULT_CODEX_WORK_ROOT = Path("/tmp/arb-codex-closed-tool")
 
-TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+")
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
 STOP_WORDS = {
     "about",

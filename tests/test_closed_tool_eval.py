@@ -5,8 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent_retrieval_bench.bcy_curve import count_tokens
 from agent_retrieval_bench.closed_tool_eval import (
     append_detail_jsonl,
+    build_seed_context,
     choose_grep_patterns,
     detect_codex_protocol_violations,
     format_read_file_observation,
@@ -91,7 +93,7 @@ class ClosedToolEvalTest(unittest.TestCase):
         for text, cap, expected in (
             ("", 1, ""),
             (" \n", 1, " \n"),
-            ("你好🙂\n", 1, "你好🙂\n"),
+            ("你好🙂\n", 3, "你好🙂\n"),
             (" alpha beta \n", 2, " alpha beta \n"),
             (" alpha beta \n", 3, " alpha beta \n"),
             (" alpha beta \n", 10**100, " alpha beta \n"),
@@ -100,6 +102,68 @@ class ClosedToolEvalTest(unittest.TestCase):
         ):
             with self.subTest(text=text, cap=cap):
                 self.assertEqual(token_prefix(text, cap), expected)
+
+    def test_token_prefix_uses_the_charged_code_tokenizer(self):
+        for text, cap, expected in (
+            ("call(x, y)", 2, "call(\n[TRUNCATED]"),
+            (";;;", 1, ";\n[TRUNCATED]"),
+            ("你好🙂\n", 1, "你\n[TRUNCATED]"),
+        ):
+            with self.subTest(text=text):
+                visible = token_prefix(text, cap)
+                self.assertEqual(visible, expected)
+                content = visible.removesuffix("\n[TRUNCATED]")
+                self.assertEqual(count_tokens(content), cap)
+
+    def test_seed_context_respects_the_charged_code_tokenizer(self):
+        context = build_seed_context(
+            files={"sample.py": "call(x, y)"}, seed_files=["sample.py"],
+            seed_label="test", max_seed_tokens=2, max_seed_tokens_per_file=2,
+            max_read_tokens=2,
+        )
+        self.assertEqual(context["tokens"], 2)
+        self.assertIn("tokens=2\ncall(\n[TRUNCATED]", context["observation"])
+        self.assertNotIn("call(x", context["observation"])
+
+    def test_model_read_respects_the_charged_code_tokenizer(self):
+        client = FakeClient([
+            '{"action":"read_file","path":"sample.py"}',
+            '{"action":"submit","files":["sample.py"]}',
+        ])
+        detail = run_closed_tool_llm_sample(
+            sample=dict(id="tokenizer-control", repo="example/repo", base_commit="base",
+                        task_type="trace2code", gold=dict(root_cause_files=["sample.py"])),
+            gold_files=["sample.py"], query_text='{"pr_title":"call"}',
+            files={"sample.py": "call(x, y)"}, model="fake", client=client,
+            max_tool_calls=2, max_read_tokens=2, max_read_tokens_per_file=2,
+            final_k=1, grep_top_k=1, max_model_turns=2,
+        )
+        self.assertEqual(detail["closed_tool"]["read_tokens"], 2)
+        self.assertEqual(len(client.responses.prompts), 2)
+        self.assertIn("tokens=2\ncall(\n[TRUNCATED]", client.responses.prompts[1])
+        self.assertNotIn("call(x", client.responses.prompts[1])
+
+    def test_scripted_policy_cannot_score_past_punctuation_budget(self):
+        prefix = "anchorcommon\n" + "; " * 200
+
+        def evaluate(suffix, per_file, total):
+            detail = run_closed_tool_sample(
+                sample=dict(id="punctuation-control", repo="example/repo", base_commit="base",
+                            task_type="trace2code", gold=dict(root_cause_files=["a.py"])),
+                gold_files=["a.py"],
+                query_text=json.dumps(dict(pr_title="anchorcommon anchorcommon", pr_body="rarebonus")),
+                files={"a.py": prefix + "nothing\n", "b.py": prefix + suffix + "\n"},
+                max_tool_calls=5, max_read_tokens=total, max_read_tokens_per_file=per_file,
+                max_grep_calls=1, final_k=1, grep_top_k=2,
+            )
+            return detail["closed_tool"]
+
+        control, changed = evaluate("nothing", 2, 4), evaluate("rarebonus", 2, 4)
+        self.assertEqual(control["read_tokens"], 4)
+        self.assertEqual(control["trace"][:-1], changed["trace"][:-1])
+        self.assertEqual(control["final_files"], changed["final_files"])
+        self.assertEqual(evaluate("nothing", 256, 512)["final_files"], ["a.py"])
+        self.assertEqual(evaluate("rarebonus", 256, 512)["final_files"], ["b.py"])
 
     def test_token_prefix_stops_after_one_lookahead_match(self):
         from agent_retrieval_bench import closed_tool_eval
