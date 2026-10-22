@@ -9,6 +9,7 @@ from agent_retrieval_bench.closed_tool_eval import (
     append_detail_jsonl,
     choose_grep_patterns,
     detect_codex_protocol_violations,
+    format_read_file_observation,
     grep_files,
     load_existing_details,
     load_seed_files,
@@ -19,6 +20,7 @@ from agent_retrieval_bench.closed_tool_eval import (
     run_closed_tool_codex_sample,
     run_closed_tool_llm_sample,
     run_closed_tool_sample,
+    token_prefix,
 )
 
 
@@ -40,6 +42,93 @@ class FakeClient:
 
 
 class ClosedToolEvalTest(unittest.TestCase):
+    def _bounded_read_policy(self, suffix, *, per_file=4, total=8):
+        prefix = "anchorcommon\n" + "padding " * 200
+        files = {"a.py": prefix + "nothing\n", "b.py": prefix + suffix + "\n"}
+        sample = dict(
+            id="bounded-read-control", repo="example/repo", base_commit="base",
+            task_type="trace2code", gold=dict(root_cause_files=["a.py"]),
+        )
+        detail = run_closed_tool_sample(
+            sample=sample, gold_files=["a.py"],
+            query_text=json.dumps(dict(pr_title="anchorcommon anchorcommon", pr_body="rarebonus")),
+            files=files, max_tool_calls=5, max_read_tokens=total,
+            max_read_tokens_per_file=per_file, max_grep_calls=1,
+            final_k=1, grep_top_k=2,
+        )
+        policy = detail["closed_tool"]
+        observations = {
+            event["path"]: format_read_file_observation(event["path"], files[event["path"]], event["tokens"])
+            for event in policy["trace"] if event["tool"] == "read_file"
+        }
+        return policy, observations
+
+    def test_scripted_policy_cannot_score_unobserved_suffix(self):
+        for total, read_sizes in ((8, [4, 4]), (6, [4, 2])):
+            with self.subTest(total=total):
+                control, before = self._bounded_read_policy("nothing", total=total)
+                changed, after = self._bounded_read_policy("rarebonus", total=total)
+                self.assertEqual(before, after)
+                self.assertNotIn("rarebonus", after["b.py"])
+                self.assertEqual(control["trace"][:-1], changed["trace"][:-1])
+                self.assertEqual(control["read_tokens"], total)
+                self.assertEqual(changed["read_tokens"], total)
+                self.assertEqual(
+                    [event["tokens"] for event in changed["trace"] if event["tool"] == "read_file"],
+                    read_sizes,
+                )
+                self.assertEqual(control["final_files"], changed["final_files"])
+
+    def test_scripted_policy_can_score_visible_suffix(self):
+        control, before = self._bounded_read_policy("nothing", per_file=256, total=512)
+        changed, after = self._bounded_read_policy("rarebonus", per_file=256, total=512)
+        self.assertNotIn("rarebonus", before["b.py"])
+        self.assertIn("rarebonus", after["b.py"])
+        self.assertEqual(control["final_files"], ["a.py"])
+        self.assertEqual(changed["final_files"], ["b.py"])
+
+    def test_token_prefix_preserves_text_at_and_below_limit(self):
+        for text, cap, expected in (
+            ("", 1, ""),
+            (" \n", 1, " \n"),
+            ("你好🙂\n", 1, "你好🙂\n"),
+            (" alpha beta \n", 2, " alpha beta \n"),
+            (" alpha beta \n", 3, " alpha beta \n"),
+            (" alpha beta \n", 10**100, " alpha beta \n"),
+            (" alpha beta gamma\n", 2, " alpha beta\n[TRUNCATED]"),
+            ("one\r\ntwo three", 2, "one\r\ntwo\n[TRUNCATED]"),
+        ):
+            with self.subTest(text=text, cap=cap):
+                self.assertEqual(token_prefix(text, cap), expected)
+
+    def test_token_prefix_stops_after_one_lookahead_match(self):
+        from agent_retrieval_bench import closed_tool_eval
+
+        pattern = closed_tool_eval.TOKEN_RE
+        for cap in (1, 3, 20):
+            consumed = []
+
+            def bounded_matches(text):
+                for match in pattern.finditer(text):
+                    consumed.append(match)
+                    self.assertLessEqual(len(consumed), cap + 1)
+                    yield match
+
+            with self.subTest(cap=cap), patch.object(
+                closed_tool_eval, "TOKEN_RE", SimpleNamespace(finditer=bounded_matches)
+            ):
+                self.assertEqual(
+                    token_prefix("word " * 10_000, cap),
+                    " ".join(["word"] * cap) + "\n[TRUNCATED]",
+                )
+                self.assertEqual(len(consumed), cap + 1)
+
+    def test_token_prefix_nonpositive_limit_does_not_scan(self):
+        with patch("agent_retrieval_bench.closed_tool_eval.TOKEN_RE") as pattern:
+            for cap in (0, -1):
+                self.assertEqual(token_prefix("unobserved text", cap), "")
+            pattern.finditer.assert_not_called()
+
     def test_choose_grep_patterns_prefers_title_and_code_terms(self):
         query = {
             "pr_title": "Fix timeout panic in async join",

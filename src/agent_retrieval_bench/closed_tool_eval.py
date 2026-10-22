@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter, defaultdict
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -578,7 +579,8 @@ def run_closed_tool_sample(
                 "is_utilized_context": False,
             }
         )
-        content_bonus = len(query_tokens & tokenize(text[:20_000])) / max(1, len(query_tokens))
+        visible_text = token_prefix(text, included_tokens)
+        content_bonus = len(query_tokens & tokenize(visible_text[:20_000])) / max(1, len(query_tokens))
         candidate_scores[path] += content_bonus
         trace.append(
             {
@@ -1371,7 +1373,7 @@ def format_read_file_observation(path: str, text: str, included_tokens: int) -> 
 def token_prefix(text: str, max_tokens: int) -> str:
     if max_tokens <= 0:
         return ""
-    matches = list(TOKEN_RE.finditer(text))
+    matches = list(islice(TOKEN_RE.finditer(text), min(max_tokens + 1, len(text))))
     if len(matches) <= max_tokens:
         return text
     end = matches[max_tokens - 1].end()
