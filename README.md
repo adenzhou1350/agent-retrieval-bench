@@ -16,6 +16,25 @@ query-file text similarity alone. A failure trace may expose a test while the
 needed file is its root-cause implementation; a review comment may name one
 file while the missing constraint lives elsewhere.
 
+## Updates
+
+**2026-10-22**
+
+- **Community results:** Added [Oko results](docs/community_results.md) with
+  pinned rankings, offline rescoring instructions, and method and tuning
+  disclosures. Community results are reported separately from the main
+  leaderboard ([#7](https://github.com/eyuansu62/agent-retrieval-bench/pull/7)).
+- **Evaluation fixes:** Made RepoMap graph construction deterministic
+  ([#3](https://github.com/eyuansu62/agent-retrieval-bench/pull/3)) and aligned
+  closed-tool scoring with delivered read observations and read-prefix
+  truncation with canonical token counting
+  ([#4](https://github.com/eyuansu62/agent-retrieval-bench/pull/4),
+  [#6](https://github.com/eyuansu62/agent-retrieval-bench/pull/6)). Published
+  RepoMap scores below predate #3; reruns with the current evaluator may differ.
+
+Thanks to [@adenzhou1350](https://github.com/adenzhou1350) and
+[@bartlomein](https://github.com/bartlomein) for these contributions.
+
 ## Paper
 
 **Agent Retrieval Bench: Evaluating Repository Context Retrieval for Coding
