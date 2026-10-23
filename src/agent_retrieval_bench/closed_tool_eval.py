@@ -112,6 +112,17 @@ ACTION_SCHEMA = {
 }
 
 
+def validate_sample_ids(samples: Iterable[dict[str, Any]]) -> None:
+    """Nonempty IDs address resume entries and must identify one selected row."""
+    seen: set[str] = set()
+    for sample in samples:
+        sample_id = str(sample.get("id") or "")
+        if sample_id in seen:
+            raise ValueError(f"duplicate sample id in selected inputs: {sample_id!r}")
+        if sample_id:
+            seen.add(sample_id)
+
+
 def evaluate_closed_tool_grep(
     *,
     sample_paths: Iterable[Path] = DEFAULT_SAMPLES,
@@ -145,6 +156,7 @@ def evaluate_closed_tool_grep(
         if limit_samples and len(samples) >= limit_samples:
             break
 
+    validate_sample_ids(samples)
     existing_details, details_handle = prepare_details_resume(details_path, force=force)
     details_by_id = dict(existing_details)
     ordered_ids: list[str] = []
@@ -254,6 +266,16 @@ def evaluate_closed_tool_openai(
         raise ValueError(f"mode must be one of {CLOSED_TOOL_MODES}")
     if (mode == "indexed_interactive") != (indexed_tools is not None):
         raise ValueError("indexed tools are required in indexed_interactive mode and only there")
+    started = time.monotonic()
+    sample_paths = list(sample_paths)
+    keep_ids = load_keep_ids(keep_list)
+    samples = []
+    for sample, manifest in filter_sample_manifests(sample_manifests(sample_paths, corpus_dir), keep_ids):
+        samples.append((sample, manifest))
+        if limit_samples and len(samples) >= limit_samples:
+            break
+
+    validate_sample_ids(sample for sample, _manifest in samples)
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set on this host.")
     try:
@@ -264,15 +286,6 @@ def evaluate_closed_tool_openai(
             api_key=str(os.environ["OPENAI_API_KEY"]),
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         )
-    started = time.monotonic()
-    sample_paths = list(sample_paths)
-    keep_ids = load_keep_ids(keep_list)
-    samples = []
-    for sample, manifest in filter_sample_manifests(sample_manifests(sample_paths, corpus_dir), keep_ids):
-        samples.append((sample, manifest))
-        if limit_samples and len(samples) >= limit_samples:
-            break
-
     existing_details, details_handle = prepare_details_resume(details_path, force=force)
     details_by_id = dict(existing_details)
     ordered_ids: list[str] = []
@@ -638,7 +651,6 @@ def evaluate_closed_tool_codex(
     max_seed_tokens: int = 0,
     max_seed_tokens_per_file: int = 1_200,
 ) -> dict[str, Any]:
-    codex_bin = resolve_codex_bin(codex_bin)
     started = time.monotonic()
     manifest = load_corpus_manifest(corpus_dir)
     keep_ids = load_keep_ids(keep_list)
@@ -648,6 +660,8 @@ def evaluate_closed_tool_codex(
         if limit_samples and len(samples) >= limit_samples:
             break
 
+    validate_sample_ids(samples)
+    codex_bin = resolve_codex_bin(codex_bin)
     seed_files_by_sample = load_seed_files(seed_details, top_k=seed_top_k)
     existing_details, details_handle = prepare_details_resume(details_path, force=force)
     details_by_id = dict(existing_details)

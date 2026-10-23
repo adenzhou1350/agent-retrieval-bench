@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,9 @@ from agent_retrieval_bench.closed_tool_eval import (
     build_seed_context,
     choose_grep_patterns,
     detect_codex_protocol_violations,
+    evaluate_closed_tool_codex,
+    evaluate_closed_tool_grep,
+    evaluate_closed_tool_openai,
     format_read_file_observation,
     grep_files,
     load_existing_details,
@@ -569,6 +574,76 @@ class ClosedToolEvalTest(unittest.TestCase):
         self.assertEqual(seeded["paired_vs_no_seed"]["rescued_any_gold_count"], 1)
         self.assertEqual(seeded["paired_vs_no_seed"]["lost_any_gold_count"], 1)
         self.assertEqual(seeded["paired_vs_no_seed"]["rescue_rate_given_no_seed_miss"], 1.0)
+
+
+class ClosedToolSampleIdentityTest(unittest.TestCase):
+    def _inputs(self, root):
+        sample = dict(
+            id="sample-one", repo="example/repo", base_commit="base",
+            task_type="trace2code", query=dict(pr_title="anchorapple"),
+            gold=dict(root_cause_files=["subject.py"]),
+        )
+        chunks = root / "chunks.jsonl"
+        self._write(chunks, [dict(path="subject.py", kind="file", text="def anchorapple(): return 1\n")])
+        self._write(root / "corpus_manifest.jsonl", [dict(
+            repo="example/repo", base_commit="base", status="ok", chunks_path=str(chunks),
+        )])
+        paths = [root / name for name in ("first.jsonl", "identical.jsonl", "conflicting.jsonl", "unique.jsonl")]
+        for path, row in zip(paths, [sample, sample, dict(sample, query=dict(pr_title="differentintent")), dict(sample, id="sample-two")]):
+            self._write(path, [row])
+        return paths
+
+    def _write(self, path, rows):
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_duplicate_ids_fail_before_dispatch_or_output_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, identical, conflicting, _unique = self._inputs(root)
+            out, details, report = (root / name for name in ("summary.json", "details.jsonl", "report.md"))
+            for path in (out, details, report):
+                path.write_text("preserve existing output\n", encoding="utf-8")
+            for evaluator in (evaluate_closed_tool_grep, evaluate_closed_tool_openai, evaluate_closed_tool_codex):
+                for second in (first, identical, conflicting):
+                    with self.subTest(evaluator=evaluator.__name__, second=second.name):
+                        kwargs = dict(sample_paths=[first, second], corpus_dir=root,
+                                      out_path=out, details_path=details, markdown_out_path=report, force=True)
+                        if evaluator is evaluate_closed_tool_codex:
+                            kwargs["codex_bin"] = Path(sys.executable)
+                        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), patch(
+                            "agent_retrieval_bench.closed_tool_eval.run_closed_tool_codex_sample",
+                            side_effect=AssertionError("must not dispatch invalid inputs"),
+                        ) as dispatch:
+                            with self.assertRaisesRegex(ValueError, "duplicate sample id.*sample-one"):
+                                evaluator(**kwargs)
+                            dispatch.assert_not_called()
+                        for path in (out, details, report):
+                            self.assertEqual(path.read_text(encoding="utf-8"), "preserve existing output\n")
+
+    def test_unique_ids_keep_both_rows_and_resume_them_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, _identical, _conflicting, unique = self._inputs(root)
+            for force in (True, False):
+                summary = evaluate_closed_tool_grep(
+                    sample_paths=[first, unique], corpus_dir=root, out_path=root / "summary.json",
+                    details_path=root / "details.jsonl", markdown_out_path=root / "report.md", force=force,
+                )
+                rows = [json.loads(line) for line in (root / "details.jsonl").read_text().splitlines()]
+                self.assertEqual(summary["evaluated"], 2)
+                self.assertEqual([row["sample_id"] for row in rows], ["sample-one", "sample-two"])
+            self.assertEqual(summary["skipped"], {"existing": 2})
+
+    def test_limit_validates_only_the_selected_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, *_rest = self._inputs(root)
+            summary = evaluate_closed_tool_grep(
+                sample_paths=[first, first], corpus_dir=root, out_path=root / "summary.json",
+                details_path=root / "details.jsonl", markdown_out_path=root / "report.md",
+                limit_samples=1, force=True,
+            )
+            self.assertEqual(summary["evaluated"], 1)
 
 
 if __name__ == "__main__":
