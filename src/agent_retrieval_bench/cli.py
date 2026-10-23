@@ -35,11 +35,13 @@ from .baseline import CANDIDATE_FILTERS, RANKERS, evaluate_corpus_baseline
 from .bcy_curve import report_bcy_budget_curve
 from .cae_validity import report_cae_validity
 from .closed_tool_eval import (
+    CLOSED_TOOL_MODES,
     evaluate_closed_tool_codex,
     evaluate_closed_tool_grep,
     evaluate_closed_tool_openai,
     report_closed_tool_budget_curve,
     report_closed_tool_seed_intervention,
+    select_closed_tool_samples,
 )
 from .clone import verify_base_commits
 from .code2test_pr import mine_code2test_prs
@@ -68,6 +70,13 @@ from .git_raw import backfill_git_raw
 from .grep_eval import GREP_PATTERN_MODES, evaluate_grep_baseline
 from .hardmine import DEFAULT_HARDMINE_SOURCES, DEFAULT_HARDMINE_TASKS, export_hardmine_candidates
 from .hardness import diagnose_hardness, filter_hard_pool, merge_seed_audits, summarize_seed_audit
+from .indexed_tools import (
+    DEFAULT_MAX_INDEX_OBSERVATION_TOKENS,
+    DEFAULT_MAX_INDEX_RESULTS,
+    IndexedTools,
+    load_tool_provider,
+    parse_provider_options,
+)
 from .io import load_targets, read_jsonl, repo_slug
 from .layered_leaderboard import report_layered_leaderboard
 from .logs import crawl_job_logs
@@ -908,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
 
     closed_tool_llm = subparsers.add_parser("eval-closed-tool-llm", help="Run an OpenAI policy under the closed-tool grep/read/submit protocol.")
     closed_tool_llm.add_argument("samples", nargs="*", type=Path, help="Benchmark sample JSONL files. Defaults to v1_3_reviewed/samples.jsonl.")
-    closed_tool_llm.add_argument("--corpus", type=Path, default=Path("data/corpus/v1_2"))
+    closed_tool_llm.add_argument("--corpus", type=Path, action="append", help="Corpus directory; repeat once per samples file to pair them in order. Defaults to data/corpus/v1_2.")
     closed_tool_llm.add_argument("--out", type=Path, default=Path("data/eval/v1_4/closed_tool_llm_summary.json"))
     closed_tool_llm.add_argument("--details", type=Path, default=Path("data/eval/v1_4/closed_tool_llm_details.jsonl"))
     closed_tool_llm.add_argument("--markdown-out", type=Path, default=Path("data/reports/v1_4/closed_tool_llm.md"))
@@ -922,6 +931,23 @@ def main(argv: list[str] | None = None) -> int:
     closed_tool_llm.add_argument("--final-k", type=int, default=3)
     closed_tool_llm.add_argument("--grep-top-k", type=int, default=12)
     closed_tool_llm.add_argument("--force", action="store_true", help="Ignore an existing details file instead of resuming completed samples.")
+    closed_tool_llm.add_argument("--mode", choices=CLOSED_TOOL_MODES, default="closed_tool", help="closed_tool offers list_dir/grep/read_file/submit; indexed_interactive adds provider lookups.")
+    closed_tool_llm.add_argument("--tool-provider", help="indexed_interactive: provider factory as module:callable.")
+    closed_tool_llm.add_argument("--tool-provider-option", action="append", default=[], help="indexed_interactive: key=value passed to the provider factory; repeatable.")
+    closed_tool_llm.add_argument("--indexed-tools", default="", help="indexed_interactive: comma-separated subset of symbol_search,references.")
+    closed_tool_llm.add_argument("--max-index-results", type=int, default=DEFAULT_MAX_INDEX_RESULTS)
+    closed_tool_llm.add_argument("--max-index-observation-tokens", type=int, default=DEFAULT_MAX_INDEX_OBSERVATION_TOKENS)
+    closed_tool_llm.add_argument("--reasoning-effort", help="Responses API reasoning effort sent on every turn, for example none.")
+    closed_tool_llm.add_argument("--retain-failures", action="store_true", help="Score a failed policy run as empty context, keep it and its partial costs in the details file, and retry it on resume.")
+    closed_tool_llm.add_argument("--require-read-submit", action="store_true", help="Reject, without charge, a submit that names no file already read, instead of ending the episode.")
+
+    closed_tool_select = subparsers.add_parser("select-closed-tool-samples", help="Freeze a seeded per-task sample set for closed-tool runs.")
+    closed_tool_select.add_argument("samples", nargs="+", type=Path, help="Benchmark sample JSONL files.")
+    closed_tool_select.add_argument("--corpus", type=Path, action="append", required=True, help="Corpus directory; repeat once per samples file to pair them in order.")
+    closed_tool_select.add_argument("--per-task", type=int, required=True)
+    closed_tool_select.add_argument("--seed", required=True)
+    closed_tool_select.add_argument("--out", type=Path, default=Path("data/eval/indexed_interactive/pilot_samples.jsonl"))
+    closed_tool_select.add_argument("--manifest-out", type=Path, default=Path("data/eval/indexed_interactive/pilot_samples_manifest.json"))
 
     closed_tool_codex = subparsers.add_parser("eval-closed-tool-codex", help="Run Codex CLI as a JSON action policy under the closed-tool protocol.")
     closed_tool_codex.add_argument("samples", nargs="*", type=Path, help="Benchmark sample JSONL files. Defaults to v1_3_reviewed/samples.jsonl.")
@@ -960,6 +986,11 @@ def main(argv: list[str] | None = None) -> int:
     closed_tool_budget.add_argument("--out", type=Path, default=Path("data/reports/v1_4/closed_tool_budget_curve.json"))
     closed_tool_budget.add_argument("--markdown-out", type=Path, default=Path("data/reports/v1_4/closed_tool_budget_curve.md"))
     closed_tool_budget.add_argument("--budgets", default="2,4,6,8", help="Comma-separated positive tool-call budgets.")
+    closed_tool_budget.add_argument(
+        "--keep-list",
+        type=Path,
+        help="Frozen sample selection; samples without a trajectory count as empty context.",
+    )
 
     closed_tool_intervention = subparsers.add_parser(
         "report-closed-tool-seed-intervention",
@@ -2788,10 +2819,33 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "select-closed-tool-samples":
+        result = select_closed_tool_samples(
+            sample_paths=args.samples,
+            corpus_dir=args.corpus,
+            per_task=args.per_task,
+            seed=args.seed,
+            out_path=args.out,
+            manifest_out_path=args.manifest_out,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
     if args.command == "eval-closed-tool-llm":
+        indexed_tools = None
+        if args.mode == "indexed_interactive":
+            if not args.tool_provider or not args.indexed_tools:
+                raise SystemExit("indexed_interactive needs --tool-provider and --indexed-tools")
+            indexed_tools = IndexedTools(
+                load_tool_provider(args.tool_provider, parse_provider_options(args.tool_provider_option)),
+                [tool.strip() for tool in args.indexed_tools.split(",") if tool.strip()],
+                max_results=args.max_index_results,
+                max_observation_tokens=args.max_index_observation_tokens,
+            )
+        elif args.tool_provider or args.indexed_tools:
+            raise SystemExit("--tool-provider and --indexed-tools need --mode indexed_interactive")
         result = evaluate_closed_tool_openai(
             sample_paths=args.samples or [Path("data/benchmark/v1_3_reviewed/samples.jsonl")],
-            corpus_dir=args.corpus,
+            corpus_dir=args.corpus or Path("data/corpus/v1_2"),
             out_path=args.out,
             details_path=args.details,
             markdown_out_path=args.markdown_out,
@@ -2805,6 +2859,11 @@ def main(argv: list[str] | None = None) -> int:
             final_k=args.final_k,
             grep_top_k=args.grep_top_k,
             force=args.force,
+            mode=args.mode,
+            indexed_tools=indexed_tools,
+            reasoning_effort=args.reasoning_effort,
+            retain_failures=args.retain_failures,
+            require_read_submit=args.require_read_submit,
         )
         print(
             json.dumps(
@@ -2884,6 +2943,7 @@ def main(argv: list[str] | None = None) -> int:
             out_path=args.out,
             markdown_out_path=args.markdown_out,
             budgets=budgets,
+            keep_list=args.keep_list,
         )
         print(
             json.dumps(

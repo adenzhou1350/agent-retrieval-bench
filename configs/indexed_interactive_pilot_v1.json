@@ -1,0 +1,654 @@
+{
+  "name": "indexed_interactive_pilot_v1",
+  "status": "frozen before any policy run on these samples",
+  "question": "Holding the policy model and budgets fixed, does adding indexed lookups change File F1 and context cost in the closed-tool loop?",
+  "dataset": {
+    "repo": "eyuansu71/agent_retrieval_bench",
+    "revision": "5901e1ee3aff048290db72edf9c63bc498b79ea3",
+    "releases": {
+      "v2_code2test": {
+        "samples": "data/benchmark/v2_code2test/samples.jsonl",
+        "sha256": "712b2699d3f963c2f940688ae5248304263c4ecda1b3831b2801c95712a50b85",
+        "corpus": "data/corpus/v2_code2test"
+      },
+      "v2_comment2context": {
+        "samples": "data/benchmark/v2_comment2context/samples.jsonl",
+        "sha256": "543267024f7f06127c50664a3a1b8825d3c213e4b12dbbfabf9a3346902ad796",
+        "corpus": "data/corpus/v2_comment2context"
+      },
+      "v2_edit2ripple": {
+        "samples": "data/benchmark/v2_edit2ripple/samples.jsonl",
+        "sha256": "31d97ffe815dda8730149880c0159239a986eceb306e5a5df816dfc420717cef",
+        "corpus": "data/corpus/v2_edit2ripple"
+      },
+      "v2_trace2code": {
+        "samples": "data/benchmark/v2_trace2code/samples.jsonl",
+        "sha256": "9d0ff50155fa4f65c1bbb632abc4f1f11393c50fa7b0a9249e06128b368b6266",
+        "corpus": "data/corpus/v2_trace2code"
+      }
+    }
+  },
+  "selection": {
+    "command": "select-closed-tool-samples",
+    "seed": "arb-indexed-interactive-pilot-2026-10",
+    "per_task": 15,
+    "definition": "Eligible: gold files, no query leakage, released corpus snapshot. Per task, repositories take turns in sha256(seed, task, repo) order; each turn takes that repository's next sample in sha256(seed, id) order. No method scores or index builds are read.",
+    "sample_count": 60,
+    "sample_ids_sha256": "6dd8c92bbc5f2101ad163d36bd08e7743aecd3297dc114556c4dbba6bede297b",
+    "excluded": {},
+    "tasks": {
+      "code2test": {
+        "eligible": 106,
+        "eligible_repos": 12,
+        "selected": 15,
+        "selected_repos": {
+          "clap-rs/clap": 1,
+          "etcd-io/etcd": 1,
+          "fastapi/fastapi": 2,
+          "gin-gonic/gin": 2,
+          "huggingface/diffusers": 1,
+          "huggingface/transformers": 1,
+          "mockito/mockito": 1,
+          "pytest-dev/pytest": 1,
+          "spring-projects/spring-boot": 2,
+          "tokio-rs/tokio": 1,
+          "vitejs/vite": 1,
+          "vuejs/core": 1
+        }
+      },
+      "comment2context": {
+        "eligible": 80,
+        "eligible_repos": 18,
+        "selected": 15,
+        "selected_repos": {
+          "HypothesisWorks/hypothesis": 1,
+          "eslint/eslint": 1,
+          "etcd-io/etcd": 1,
+          "huggingface/diffusers": 1,
+          "huggingface/transformers": 1,
+          "ipython/ipython": 1,
+          "microsoft/playwright": 1,
+          "numpy/numpy": 1,
+          "pydantic/pydantic": 1,
+          "pypa/pip": 1,
+          "pytest-dev/pytest": 1,
+          "python/mypy": 1,
+          "tokio-rs/tokio": 1,
+          "vitejs/vite": 1,
+          "vuejs/core": 1
+        }
+      },
+      "edit2ripple": {
+        "eligible": 58,
+        "eligible_repos": 10,
+        "selected": 15,
+        "selected_repos": {
+          "caddyserver/caddy": 2,
+          "clap-rs/clap": 1,
+          "etcd-io/etcd": 1,
+          "gin-gonic/gin": 2,
+          "huggingface/diffusers": 1,
+          "huggingface/transformers": 2,
+          "pytest-dev/pytest": 1,
+          "spring-projects/spring-boot": 2,
+          "tokio-rs/tokio": 2,
+          "vitejs/vite": 1
+        }
+      },
+      "trace2code": {
+        "eligible": 101,
+        "eligible_repos": 7,
+        "selected": 15,
+        "selected_repos": {
+          "caddyserver/caddy": 2,
+          "clap-rs/clap": 1,
+          "etcd-io/etcd": 3,
+          "gin-gonic/gin": 3,
+          "pallets/click": 2,
+          "pytest-dev/pytest": 1,
+          "tokio-rs/tokio": 3
+        }
+      }
+    }
+  },
+  "policy": {
+    "path": "eval-closed-tool-llm (OpenAI Responses API)",
+    "model": "gpt-5.4-mini-2026-03-17",
+    "reasoning_effort": "none",
+    "temperature": 0,
+    "max_output_tokens": 700,
+    "trajectories_per_sample_arm": 1
+  },
+  "budget": {
+    "max_tool_calls": 16,
+    "max_model_turns": 20,
+    "max_read_tokens": 8000,
+    "max_read_tokens_per_file": 1200,
+    "final_k": 3,
+    "grep_top_k": 12,
+    "max_index_results": 10,
+    "max_index_observation_tokens": 400,
+    "retain_failures": true,
+    "require_read_submit": true
+  },
+  "arms": {
+    "A": {
+      "mode": "closed_tool",
+      "tools": [
+        "list_dir",
+        "grep",
+        "read_file",
+        "submit"
+      ]
+    },
+    "B": {
+      "mode": "indexed_interactive",
+      "indexed_tools": [
+        "symbol_search"
+      ]
+    },
+    "C": {
+      "mode": "indexed_interactive",
+      "indexed_tools": [
+        "symbol_search",
+        "references"
+      ]
+    }
+  },
+  "execution": {
+    "command": "arb eval-closed-tool-llm <the four v2 samples files> --corpus <each release's corpus, in order>",
+    "common_flags": [
+      "--keep-list pilot_samples.jsonl",
+      "--model gpt-5.4-mini-2026-03-17",
+      "--reasoning-effort none",
+      "--max-tool-calls 16",
+      "--max-model-turns 20",
+      "--max-read-tokens 8000",
+      "--max-read-tokens-per-file 1200",
+      "--final-k 3",
+      "--grep-top-k 12",
+      "--retain-failures",
+      "--require-read-submit"
+    ],
+    "arms": {
+      "A": [
+        "--mode closed_tool"
+      ],
+      "B": [
+        "--mode indexed_interactive",
+        "--indexed-tools symbol_search",
+        "--tool-provider codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
+        "--tool-provider-option workspace=<checkout dir>",
+        "--tool-provider-option cache=<graph cache dir>",
+        "--tool-provider-option retry_failed=false",
+        "--max-index-results 10",
+        "--max-index-observation-tokens 400"
+      ],
+      "C": [
+        "--mode indexed_interactive",
+        "--indexed-tools symbol_search,references",
+        "--tool-provider codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
+        "--tool-provider-option workspace=<checkout dir>",
+        "--tool-provider-option cache=<graph cache dir>",
+        "--tool-provider-option retry_failed=false",
+        "--max-index-results 10",
+        "--max-index-observation-tokens 400"
+      ]
+    },
+    "prefix_report": "arb report-closed-tool-budget-curve --details details_<arm>.jsonl --keep-list pilot_samples.jsonl",
+    "notes": "--require-read-submit is enabled in all three arms; its default stays off for other runs."
+  },
+  "provider": {
+    "name": "CodeNib",
+    "factory": "codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
+    "source_access": "full-source: indexes built from a clean checkout at base_commit; hits limited to released files",
+    "commit": "recorded in each run summary"
+  },
+  "analysis": {
+    "primary": [
+      "final File F1",
+      "final any-gold",
+      "any-gold read"
+    ],
+    "cost": [
+      "tool calls",
+      "index calls",
+      "read tokens",
+      "observation tokens",
+      "model input and output tokens",
+      "rejected submits, with their model turns and tokens",
+      "earlier attempts of retried samples (prior_attempts), totalled apart",
+      "index build seconds (per snapshot, reported separately)"
+    ],
+    "contrasts": {
+      "B - A": "adding symbol_search, including its full-source information",
+      "C - B": "adding references on top of symbol_search"
+    },
+    "intervals": "paired differences with a 95% percentile bootstrap that resamples repositories (all of a repository's selected samples together), 10,000 resamples",
+    "slices": "per task and per dev/heldout label, descriptive only",
+    "denominator": "all 60 selected samples in every arm, including unavailable indexes, failures, and budget exhaustion",
+    "scope": "single model, single run per sample and arm; does not measure policy-run variability"
+  },
+  "samples": [
+    {
+      "sample_id": "8a1219475ef9f0e5271d7bd9",
+      "task_type": "code2test",
+      "repo": "gin-gonic/gin",
+      "base_commit": "9914178584e42458ff7d23891463a880f58c9d86",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "9c3412dfb452df23d783c5e6",
+      "task_type": "code2test",
+      "repo": "spring-projects/spring-boot",
+      "base_commit": "c44336780d964f2ba03dc6b97f5e866970232891",
+      "split": "dev"
+    },
+    {
+      "sample_id": "94f11ff5d8076850f94d6f04",
+      "task_type": "code2test",
+      "repo": "mockito/mockito",
+      "base_commit": "82998ff78a14b2111e07ba24c5a7fa731a5f0a82",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "dd57d697481176a1c52bd8d0",
+      "task_type": "code2test",
+      "repo": "fastapi/fastapi",
+      "base_commit": "cbd64b09a32681d3b0ea097608bc62eb0d1587e0",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "e6b3d0834b130dd9a2b7015d",
+      "task_type": "code2test",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "4d386750cb390bf72119ff6bb11b06da64fb6941",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "e304584124e9a1194c558fbc",
+      "task_type": "code2test",
+      "repo": "vuejs/core",
+      "base_commit": "abe8fcd79cd2186ef3494ce5a04e55364b349400",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "9c620240e44f40fd7c2aaba0",
+      "task_type": "code2test",
+      "repo": "huggingface/transformers",
+      "base_commit": "7028c30b6df3369f984469a089d26037e4ce3c1b",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "810b8fe144165198bc8de283",
+      "task_type": "code2test",
+      "repo": "etcd-io/etcd",
+      "base_commit": "747bf5ceff62a064141acf25e1a6bdbb3a2a8e92",
+      "split": "dev"
+    },
+    {
+      "sample_id": "81051ce9f995fdb7e2deba4b",
+      "task_type": "code2test",
+      "repo": "huggingface/diffusers",
+      "base_commit": "357b6818903f0990a5e4815f31d1655555a035a7",
+      "split": "dev"
+    },
+    {
+      "sample_id": "3e1ace6bf8d886265dbe6307",
+      "task_type": "code2test",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "3b5a15dfdfc5dc789dcb80cef0986fb2fa5cac0a",
+      "split": "dev"
+    },
+    {
+      "sample_id": "8e5f31c02cbb5bd1563ea5d1",
+      "task_type": "code2test",
+      "repo": "clap-rs/clap",
+      "base_commit": "14202755e52802a3d294c4ceeadd703d24b21fe6",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "cb31b15882b858e2806de7c0",
+      "task_type": "code2test",
+      "repo": "vitejs/vite",
+      "base_commit": "2540ed06d0b6f93829d2d764b6a02f7dbfd14923",
+      "split": "dev"
+    },
+    {
+      "sample_id": "46cbbb206ba9c760f4550ec1",
+      "task_type": "code2test",
+      "repo": "gin-gonic/gin",
+      "base_commit": "a481ee2897af1e368de5c919fbeb21b89aa26fc7",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "d58f6487e6e2721dd5266c21",
+      "task_type": "code2test",
+      "repo": "spring-projects/spring-boot",
+      "base_commit": "b36edad27d3139cbb0971de1224454311cf20bd4",
+      "split": "dev"
+    },
+    {
+      "sample_id": "7f2b7ed09afc0e1e57683529",
+      "task_type": "code2test",
+      "repo": "fastapi/fastapi",
+      "base_commit": "bc06e4296d588f39f38c7ac2fc96d3913c565962",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "274d3a66fcf1f52cec4d6c13",
+      "task_type": "comment2context",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "8f81c76744daf72d4f77cfc8423f4bdc60733d78",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "8d19ca90da7a3f1ce81d3654",
+      "task_type": "comment2context",
+      "repo": "huggingface/diffusers",
+      "base_commit": "c8c84018e0d8704e44d68ff18b634f1f61a717f6",
+      "split": "dev"
+    },
+    {
+      "sample_id": "d5f1198f6fb5e19244fd4ac7",
+      "task_type": "comment2context",
+      "repo": "etcd-io/etcd",
+      "base_commit": "da66a4f234d55ee27f3259e4111a29bfb4e44900",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "a467dd604220332910c7e4e4",
+      "task_type": "comment2context",
+      "repo": "ipython/ipython",
+      "base_commit": "cd483f2f927c09be71dd5885618d7b2443a81b7a",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "bf47308900fafdff5ca96ecd",
+      "task_type": "comment2context",
+      "repo": "HypothesisWorks/hypothesis",
+      "base_commit": "c1d70b89c5d586660e1b21fdf422a10fd14e9d6c",
+      "split": "dev"
+    },
+    {
+      "sample_id": "106d7add9c91db6d52f8153a",
+      "task_type": "comment2context",
+      "repo": "pydantic/pydantic",
+      "base_commit": "1a37a3d479dea9b21c7379e882bf5ec56fb94fc2",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "1aed02fc2c6d73a0ae8e2f1f",
+      "task_type": "comment2context",
+      "repo": "numpy/numpy",
+      "base_commit": "4d711763f8c5b978abd88cea710147c14d802675",
+      "split": "dev"
+    },
+    {
+      "sample_id": "08152da08307954bc8ce76d3",
+      "task_type": "comment2context",
+      "repo": "vuejs/core",
+      "base_commit": "cea3cf758645c9683db51822590b073ce3069dda",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "70637f29f6cbc720fd50d434",
+      "task_type": "comment2context",
+      "repo": "huggingface/transformers",
+      "base_commit": "a553395766001116a719c82870171f8d6b458c98",
+      "split": "dev"
+    },
+    {
+      "sample_id": "449280b38ce700056be47fe",
+      "task_type": "comment2context",
+      "repo": "eslint/eslint",
+      "base_commit": "78892043a36da4aa7640b59c99344b00c181048a",
+      "split": "dev"
+    },
+    {
+      "sample_id": "c00e6405f350021e79f5710f",
+      "task_type": "comment2context",
+      "repo": "pypa/pip",
+      "base_commit": "b369bfc96cc524e00c267e1693290e6599c36bad",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "2f39489dd27f283deb0f7fae",
+      "task_type": "comment2context",
+      "repo": "microsoft/playwright",
+      "base_commit": "00dcb5cd511e1e1a1af9dded0b16a975ea7591de",
+      "split": "dev"
+    },
+    {
+      "sample_id": "c2af1d6140c0b8b749bd1b77",
+      "task_type": "comment2context",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "d3c7f56c10a43c220e6feb12c9796f36eaffda16",
+      "split": "dev"
+    },
+    {
+      "sample_id": "056f7ac0b2a4940bc1ad5342",
+      "task_type": "comment2context",
+      "repo": "vitejs/vite",
+      "base_commit": "a4d828f2d5ed85440bc0774eab342e6f9a5e5f62",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "4cdc08901ee5dc7613bfa293",
+      "task_type": "comment2context",
+      "repo": "python/mypy",
+      "base_commit": "f60d40b47ea76ad817f0cf36a7c9a673e54a35f6",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "0978d6fdeb5a091c654607c7",
+      "task_type": "edit2ripple",
+      "repo": "huggingface/diffusers",
+      "base_commit": "40e96454f122a8220342429507f5652fdafe57e6",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "78906550756a325d653e88b9",
+      "task_type": "edit2ripple",
+      "repo": "spring-projects/spring-boot",
+      "base_commit": "6c66555a6efa4936bf01459729f6869f20d4237f",
+      "split": "dev"
+    },
+    {
+      "sample_id": "ce7c3a91b303d6ce15a685e0",
+      "task_type": "edit2ripple",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "25e7f2641ef2555d688c267059431a2802805f1d",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "72f498bd4cd6b3fee84ad9e2",
+      "task_type": "edit2ripple",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "0c80a1c836616b0206a4af2fe72001ff797a5f8f",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "2ab29030d7f263704018f085",
+      "task_type": "edit2ripple",
+      "repo": "huggingface/transformers",
+      "base_commit": "23d3e8c251dfcc0f409cc2d2787864c813b3ce63",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "f0e2f6c47c53aab117eca775",
+      "task_type": "edit2ripple",
+      "repo": "caddyserver/caddy",
+      "base_commit": "ca0ca67fbdb831c026d334dfd77ecc653f321876",
+      "split": "dev"
+    },
+    {
+      "sample_id": "845b2c207a9d6a99d2d0f83c",
+      "task_type": "edit2ripple",
+      "repo": "gin-gonic/gin",
+      "base_commit": "b4f66e965ba9d60257e0de4c25d4ad4bd6115927",
+      "split": "dev"
+    },
+    {
+      "sample_id": "d6dbe66e15d389619fb51499",
+      "task_type": "edit2ripple",
+      "repo": "etcd-io/etcd",
+      "base_commit": "5485c710674b5990f62e83984d180b4b552fa52c",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "fd824e5a0cecb1d3d2ab7bf2",
+      "task_type": "edit2ripple",
+      "repo": "clap-rs/clap",
+      "base_commit": "e82e1edf76bcbddf5fe53428d297520d76a6a300",
+      "split": "dev"
+    },
+    {
+      "sample_id": "bf0ff8578398a3db3e0fcad4",
+      "task_type": "edit2ripple",
+      "repo": "vitejs/vite",
+      "base_commit": "5ba688bc422c54944bc6fc563bfe1ba2616a0911",
+      "split": "dev"
+    },
+    {
+      "sample_id": "445f0e5cb04c0403b28b2294",
+      "task_type": "edit2ripple",
+      "repo": "spring-projects/spring-boot",
+      "base_commit": "f280d127295245aa3bc8119e395d914c9e577b47",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "18a155cebfee9969b166934c",
+      "task_type": "edit2ripple",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "d3c7f56c10a43c220e6feb12c9796f36eaffda16",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "9a326250f0d9b6336a9cf026",
+      "task_type": "edit2ripple",
+      "repo": "huggingface/transformers",
+      "base_commit": "23d3e8c251dfcc0f409cc2d2787864c813b3ce63",
+      "split": "dev"
+    },
+    {
+      "sample_id": "0631449332f969f725276ef8",
+      "task_type": "edit2ripple",
+      "repo": "caddyserver/caddy",
+      "base_commit": "7586e68e273fbe84b588e73c014d15d815413648",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "02faf838effb2bcebf8d8cca",
+      "task_type": "edit2ripple",
+      "repo": "gin-gonic/gin",
+      "base_commit": "db309081bc5c137b2aa15701ef53f7f19788da25",
+      "split": "dev"
+    },
+    {
+      "sample_id": "2d65eeb2c97d07f557b1ddb2",
+      "task_type": "trace2code",
+      "repo": "clap-rs/clap",
+      "base_commit": "e82e1edf76bcbddf5fe53428d297520d76a6a300",
+      "split": "dev"
+    },
+    {
+      "sample_id": "9151d23c9630aed754b3355b",
+      "task_type": "trace2code",
+      "repo": "gin-gonic/gin",
+      "base_commit": "0cbb30aa940a643e31874f8ad8e355219d306756",
+      "split": "dev"
+    },
+    {
+      "sample_id": "a9432b3d44a06f48f40060bb",
+      "task_type": "trace2code",
+      "repo": "etcd-io/etcd",
+      "base_commit": "c64f8fd68c2e75cc65b88bc0d956547a5f77cab1",
+      "split": "dev"
+    },
+    {
+      "sample_id": "1132f037ebb462f13652adff",
+      "task_type": "trace2code",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "873cb8ae2fc291eaffbd71e3c83d17b2f0ed7abf",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "f7d79ec3fd20e651c379facb",
+      "task_type": "trace2code",
+      "repo": "caddyserver/caddy",
+      "base_commit": "95941a71e87d6ccd6318bfd95c56929b01edfafd",
+      "split": "dev"
+    },
+    {
+      "sample_id": "e50d9d504a467c632442042e",
+      "task_type": "trace2code",
+      "repo": "pallets/click",
+      "base_commit": "1a4d8c1bb1e8f8e214ede7223bd2c05dc2ce006a",
+      "split": "dev"
+    },
+    {
+      "sample_id": "c727abdbfcdfc9879df581d2",
+      "task_type": "trace2code",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "c26c145e0fcef51426d64a184d0faa651777f86f",
+      "split": "dev"
+    },
+    {
+      "sample_id": "c06816923c65bcd86bfd1c2a",
+      "task_type": "trace2code",
+      "repo": "gin-gonic/gin",
+      "base_commit": "c4287b1300363cb3dc2c8408299d3ba6deded485",
+      "split": "dev"
+    },
+    {
+      "sample_id": "b389823a6435d1ada9d7d2b9",
+      "task_type": "trace2code",
+      "repo": "etcd-io/etcd",
+      "base_commit": "b83b67e483936a94e59a61198934e88bf0ef95b1",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "118b720b3e60d4c6679b9ec0",
+      "task_type": "trace2code",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "670a907c55c7f7b27da203208e65da60de6598b2",
+      "split": "dev"
+    },
+    {
+      "sample_id": "d4149b3f568dfe275250b62e",
+      "task_type": "trace2code",
+      "repo": "caddyserver/caddy",
+      "base_commit": "ef496e58ef9e7844cf8f1831030713ee5e9b354b",
+      "split": "dev"
+    },
+    {
+      "sample_id": "f4fccd0dc58a48c09a195d6b",
+      "task_type": "trace2code",
+      "repo": "pallets/click",
+      "base_commit": "8d3449517a97b6fd457a025bd9c3d2acfd301fa4",
+      "split": "dev"
+    },
+    {
+      "sample_id": "e8f3298d52397c17e0fa1bc9",
+      "task_type": "trace2code",
+      "repo": "gin-gonic/gin",
+      "base_commit": "f75144a356e57c95bd21a048f0a40492dcdb33c5",
+      "split": "dev"
+    },
+    {
+      "sample_id": "19c290f5b37ff6d5a93db942",
+      "task_type": "trace2code",
+      "repo": "etcd-io/etcd",
+      "base_commit": "be3acf4ed017efb7008beb08585d890e5364ce93",
+      "split": "heldout"
+    },
+    {
+      "sample_id": "30a18c73cca02d3672705be7",
+      "task_type": "trace2code",
+      "repo": "tokio-rs/tokio",
+      "base_commit": "670a907c55c7f7b27da203208e65da60de6598b2",
+      "split": "heldout"
+    }
+  ]
+}
