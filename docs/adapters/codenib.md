@@ -8,11 +8,11 @@ without running retrieval. The adapter lives in the CodeNib repository; ARB
 does not depend on it. Discussion:
 [issue #2](https://github.com/eyuansu62/agent-retrieval-bench/issues/2).
 
-This is a compatibility check, not a retrieval result. All 345 positive
-samples pass the adapter's preparation step, and an eight-sample run produces
-the same scores natively and on offline rescoring. A full 345-sample retrieval
-run has not been made, so no scores are offered for comparison with the main
-table.
+This page documents the initial BM25 compatibility check at the pinned
+revision below. All 345 positive samples pass the adapter's preparation step,
+and an eight-sample run produces the same scores natively and on offline
+rescoring. The subsequent full 345-sample comparison is recorded in
+[Community Results](../community_results.md#codenib).
 
 ## What the adapter does
 
@@ -30,9 +30,10 @@ The fields follow the [reporting contract](reporting_contract.md).
 | Index | In-memory BM25 per sample; no graph or embedding index |
 | Model usage | None |
 
-One contract item is not yet met. The per-sample `retrieval_seconds` field
-covers corpus loading, index construction, and the query together, and index
-size is not recorded. A full run will report them separately.
+In this initial smoke, the per-sample `retrieval_seconds` field covers corpus
+loading, index construction, and the query together, and index size is not
+recorded. The subsequent [full comparison](../community_results.md#codenib)
+reports index and query costs separately.
 
 ## Versions
 

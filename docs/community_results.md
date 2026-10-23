@@ -238,7 +238,7 @@ is CodeNib as released, without that change
 | Method | Index per snapshot | Ranking |
 | --- | --- | --- |
 | BM25 | CodeNib BM25 over every released file and symbol chunk | All chunks ranked; a file takes the rank of its first chunk |
-| Dense | Exact inner-product search over `Qwen/Qwen3-Embedding-0.6B` vectors of every chunk (512 tokens, no instruction, bfloat16) | Same first-hit file ranking |
+| Dense | Exact inner-product search over `Qwen/Qwen3-Embedding-0.6B` vectors of every chunk (maximum 512 tokens per query or chunk, no query instruction, bfloat16) | Same first-hit file ranking |
 | Hybrid | Both of the above | File-level reciprocal rank fusion (k = 60) of the BM25 and dense file rankings |
 | Zoekt | Zoekt trigram index of every file and symbol chunk | One literal Zoekt query per code-like term in the query (file names, backticked spans, identifiers; at most 32); files ordered by matched terms, then first match |
 | Graph expansion | BM25 as above, plus a SCIP code graph of the full source | The top five BM25 files, then up to 15 released files linked to them by compiler-resolved references, then the rest in BM25 order |
@@ -250,13 +250,20 @@ is reset and cleaned before every use. Its graph neighbors outside the
 released files are dropped and counted (166 in total). BCY always uses
 released text.
 
-**Query.** The released `query` object as JSON with sorted keys, which is the
-same text as `query_text_for_eval`. No truncation. No other sample field
-reaches retrieval.
+**Query.** The adapter serializes the full released `query` object as JSON
+with sorted keys, the same text as `query_text_for_eval`, without preprocessing
+truncation. Dense and the dense branch of hybrid then apply the encoder's
+512-token limit to queries as well as chunks. With the pinned model tokenizer,
+124 of 345 queries exceed that limit: 15/106 code2test, 2/80 comment2context,
+52/101 trace2code, and 55/58 edit2ripple. BM25 and graph expansion use the full
+serialized query; Zoekt extracts at most 32 terms as described above. No other
+sample field reaches retrieval.
 
-**Ranking.** BM25, dense, and hybrid rank every released file and symbol chunk
-and keep each file at its first chunk; graph expansion reorders the BM25
-ranking. Zoekt ranks only files that match a term. MRR uses the full ranking.
+**Ranking.** BM25 and dense rank every released file and symbol chunk, then
+keep each file at its first chunk. Hybrid combines those two complete file
+rankings with equal-weight reciprocal rank fusion (k = 60). Graph expansion
+reorders the BM25 file ranking. Zoekt ranks only files that match a term.
+MRR uses the full supplied file ranking.
 
 **Graph coverage.** A graph was built for 190 of the 218 snapshots (290 of 345
 samples). Seventeen transformers snapshots and one diffusers snapshot hit
