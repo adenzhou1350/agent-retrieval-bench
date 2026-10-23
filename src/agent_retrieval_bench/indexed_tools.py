@@ -39,6 +39,9 @@ INDEXED_TOOLS = ("symbol_search", "references")
 DEFAULT_MAX_INDEX_RESULTS = 10
 DEFAULT_MAX_INDEX_OBSERVATION_TOKENS = 400
 MAX_FIELD_CHARS = 120
+# Echoed arguments shrink before a lookup's status line would break the cap:
+# in full, cut to this many characters, then not at all.
+SHORT_ECHO_CHARS = 24
 
 TOOL_DESCRIPTIONS = {
     "symbol_search": "symbol_search: definitions named `symbol`, as path and line range.",
@@ -94,6 +97,13 @@ class IndexedTools:
             raise ValueError(f"indexed tools must be a non-empty subset of {INDEXED_TOOLS}, got {sorted(requested)}")
         if max_results <= 0 or max_observation_tokens <= 0:
             raise ValueError("indexed-tool result and observation caps must be positive")
+        for tool in requested:
+            needed = minimal_observation_tokens(tool)
+            if needed > max_observation_tokens:
+                raise ValueError(
+                    f"max_observation_tokens={max_observation_tokens} cannot hold a minimal {tool} "
+                    f"response ({needed} tokens)"
+                )
         self.provider = provider
         self.tools = tuple(tool for tool in INDEXED_TOOLS if tool in requested)
         self.max_results = max_results
@@ -137,7 +147,7 @@ class IndexedTools:
         if not symbol or len(symbol) > MAX_FIELD_CHARS:
             return {"error": f"{tool} requires a symbol of 1 to {MAX_FIELD_CHARS} characters."}
         if tool == "references" and path not in files:
-            return {"error": f"references path not found: {path}"}
+            return {"error": f"references path not found: {shorten(path, MAX_FIELD_CHARS)}"}
         arguments = {"symbol": symbol} if tool == "symbol_search" else {"path": path, "symbol": symbol}
         limit = clamp_limit(action.get("top_k"), self.max_results)
         started = time.monotonic()
@@ -148,11 +158,9 @@ class IndexedTools:
             raw, provider_error = [], f"{type(exc).__name__}: {exc}"[:300]
         latency = time.monotonic() - started
         hits, outside = released_hits(raw, files)
-        shown = hits[:limit]
-        observation = format_index_observation(tool, arguments, shown, len(hits) - len(shown), provider_error)
-        while shown and count_tokens(observation) > self.max_observation_tokens:
-            shown = shown[:-1]
-            observation = format_index_observation(tool, arguments, shown, len(hits) - len(shown), provider_error)
+        observation, shown = fit_observation(
+            tool, arguments, hits, hits[:limit], provider_error, self.max_observation_tokens
+        )
         return {
             "error": "",
             "observation": observation,
@@ -216,18 +224,70 @@ def field_text(value: Any) -> str:
     return " ".join(str(value).split())[:MAX_FIELD_CHARS] if isinstance(value, str) else ""
 
 
-def format_index_observation(
+def fit_observation(
     tool: str,
     arguments: dict[str, str],
     hits: list[dict[str, Any]],
+    shown: list[dict[str, Any]],
+    provider_error: str,
+    cap: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    """The complete observation within ``cap`` tokens, and the hits it shows.
+
+    The fullest echo of the arguments whose hit-free response fits is kept,
+    then hits are trimmed from the end. The constructor guarantees that the
+    response without echo or counts fits.
+    """
+    for echo in (None, SHORT_ECHO_CHARS, 0):
+        header = observation_header(tool, arguments, echo)
+        if count_tokens(format_index_observation(header, [], len(hits), provider_error)) <= cap:
+            break
+    else:
+        header = observation_header(tool, arguments, 0)
+        return format_index_observation(header, [], len(hits), provider_error, counts=False), []
+    observation = format_index_observation(header, shown, len(hits) - len(shown), provider_error)
+    while shown and count_tokens(observation) > cap:
+        shown = shown[:-1]
+        observation = format_index_observation(header, shown, len(hits) - len(shown), provider_error)
+    return observation, shown
+
+
+def minimal_observation_tokens(tool: str) -> int:
+    """Tokens of the largest response without echoed arguments or counts."""
+    header = observation_header(tool, {}, 0)
+    return max(
+        count_tokens(format_index_observation(header, [], omitted, error, counts=False))
+        for omitted, error in ((0, ""), (1, ""), (0, "failed"))
+    )
+
+
+def observation_header(tool: str, arguments: dict[str, str], echo: int | None) -> str:
+    """``OBS tool`` and its arguments, each cut to ``echo`` characters (all, if None)."""
+    if echo == 0:
+        return f"OBS {tool}"
+    shown = {key: value if echo is None else shorten(value, echo) for key, value in arguments.items()}
+    return f"OBS {tool} " + " ".join(f"{key}={value!r}" for key, value in shown.items())
+
+
+def shorten(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: max(limit - 1, 0)] + "…"
+
+
+def format_index_observation(
+    header: str,
+    hits: list[dict[str, Any]],
     omitted: int,
     provider_error: str,
+    *,
+    counts: bool = True,
 ) -> str:
-    header = f"OBS {tool} " + " ".join(f"{key}={value!r}" for key, value in arguments.items())
     if provider_error:
         return f"{header}\n(index lookup failed)"
     if not hits:
-        return f"{header}\n(no hits)"
+        if not omitted:
+            return f"{header}\n(no hits)"
+        detail = f"{omitted} hits" if counts else "hits"
+        return f"{header}\n({detail} omitted to fit the observation cap)"
     lines = [header]
     for index, hit in enumerate(hits, start=1):
         span = ""

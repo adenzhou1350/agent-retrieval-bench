@@ -278,14 +278,15 @@ def evaluate_closed_tool_openai(
     ordered_ids: list[str] = []
     skipped = Counter()
     failures: list[dict[str, Any]] = []
-    failed_details: list[dict[str, Any]] = []
     file_cache: dict[Path, dict[str, str]] = {}
     with details_handle:
         for sample, manifest in samples:
             sample_id = str(sample.get("id") or "")
             if sample_id:
                 ordered_ids.append(sample_id)
-            if sample_id in details_by_id:
+            previous = details_by_id.get(sample_id)
+            # A retained failure is retried; a completed trajectory is kept.
+            if previous is not None and "failure" not in previous.get("closed_tool", {}):
                 skipped["existing"] += 1
                 continue
             gold_files = target_gold_files(sample)
@@ -327,18 +328,26 @@ def evaluate_closed_tool_openai(
                     reasoning_effort=reasoning_effort,
                     require_read_submit=require_read_submit,
                 )
-                if sample_id:
-                    details_by_id[sample_id] = detail
-                append_detail_jsonl(details_handle, detail)
             except Exception as exc:
                 failure = {"sample_id": sample_id, "error": type(exc).__name__, "message": str(exc)}
                 failures.append(failure)
-                if retain_failures:
-                    failed_details.append(failed_closed_tool_detail(sample, gold_files, failure, policy=f"openai_{mode}"))
+                if not retain_failures:
+                    continue
+                # The failed attempt scores as empty context but keeps its costs.
+                detail = getattr(exc, "partial_detail", None) or failed_closed_tool_detail(
+                    sample, gold_files, failure, policy=f"openai_{mode}", index_status=index_status
+                )
+                detail["closed_tool"]["failure"] = {**detail["closed_tool"].get("failure", {}), **failure}
+            if previous is not None:
+                detail["closed_tool"]["prior_attempts"] = prior_attempts(previous)
+            if sample_id:
+                details_by_id[sample_id] = detail
+            append_detail_jsonl(details_handle, detail)
     details = [details_by_id[sample_id] for sample_id in ordered_ids if sample_id in details_by_id]
-    # Failed samples score zero in the summary; the details file keeps only
-    # completed trajectories, so resuming retries the failures.
-    scored = details + failed_details
+    completed = [detail for detail in details if "failure" not in detail.get("closed_tool", {})]
+    # Retained failures score zero in the summary and stay in the details
+    # file, so later analyses keep the denominator; resuming retries them.
+    scored = details if retain_failures else completed
 
     allowed_tools = list(MINIMAL_TOOLS) + (list(indexed_tools.tools) if indexed_tools else [])
     summary = {
@@ -346,7 +355,7 @@ def evaluate_closed_tool_openai(
         "policy": f"openai_{mode}",
         "model": model,
         "setting": mode,
-        "evaluated": len(details),
+        "evaluated": len(completed),
         "scored": len(scored),
         "retain_failures": retain_failures,
         "skipped": dict(skipped),
@@ -382,9 +391,9 @@ def evaluate_closed_tool_openai(
     if indexed_tools is not None:
         summary["indexed_tools"] = indexed_tools.describe()
         # Index builds are a per-snapshot cost, reported apart from the policy run.
-        summary["index_builds"] = list(indexed_tools.snapshots.values())
+        summary["index_builds"] = index_builds(details, indexed_tools.snapshots)
     write_json(out_path, summary)
-    write_jsonl(details_path, details)
+    write_jsonl(details_path, scored)
     ensure_parent(markdown_out_path)
     markdown_out_path.write_text(render_markdown(summary), encoding="utf-8")
     return summary
@@ -413,9 +422,14 @@ def filter_sample_manifests(
 
 
 def failed_closed_tool_detail(
-    sample: dict[str, Any], gold_files: list[str], failure: dict[str, Any], *, policy: str
+    sample: dict[str, Any],
+    gold_files: list[str],
+    failure: dict[str, Any],
+    *,
+    policy: str,
+    index_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """A zero-context trajectory that keeps a failed sample in the denominator."""
+    """A zero-context trajectory for a sample that failed before any policy turn."""
     detail = trajectory_detail(sample, gold_files, [], supporting_files=supporting_context_files(sample))
     detail["closed_tool"] = {
         "policy": policy,
@@ -428,7 +442,56 @@ def failed_closed_tool_detail(
         "first_gold_step": None,
         "trace": [],
     }
+    if index_status is not None:
+        detail["closed_tool"].update(
+            index_status={key: value for key, value in index_status.items() if key not in {"repo", "base_commit"}},
+            index_calls=0,
+            index_calls_by_tool={},
+            index_observation_tokens=0,
+            index_provider_errors=0,
+        )
     return detail
+
+
+ATTEMPT_FIELDS = (
+    "failure",
+    "tool_calls",
+    "grep_calls",
+    "read_calls",
+    "read_tokens",
+    "observation_tokens",
+    "model_usage",
+    "rejected_submits",
+    "rejected_submit_model_usage",
+    "index_calls",
+    "index_calls_by_tool",
+    "index_observation_tokens",
+    "index_provider_errors",
+    "latency_seconds",
+    "trace",
+)
+
+
+def prior_attempts(previous: dict[str, Any]) -> list[dict[str, Any]]:
+    """Earlier failed attempts of a retried sample, with their costs and traces."""
+    policy = previous.get("closed_tool", {})
+    attempt = {key: policy[key] for key in ATTEMPT_FIELDS if key in policy}
+    return [*policy.get("prior_attempts", []), attempt]
+
+
+def index_builds(details: list[dict[str, Any]], snapshots: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    """One preparation record per snapshot: the one stored with its first
+    trajectory in sample order, else this run's, so a resume keeps the
+    records of snapshots it did not prepare again."""
+    builds: dict[tuple[str, str], dict[str, Any]] = {}
+    for detail in details:
+        status = detail.get("closed_tool", {}).get("index_status")
+        key = (str(detail.get("repo") or ""), str(detail.get("base_commit") or ""))
+        if isinstance(status, dict) and key not in builds:
+            builds[key] = {"repo": key[0], "base_commit": key[1], **status}
+    for key, status in snapshots.items():
+        builds.setdefault(key, dict(status))
+    return list(builds.values())
 
 
 def select_closed_tool_samples(
@@ -949,6 +1012,10 @@ def run_closed_tool_llm_sample(
     final_files: list[str] = []
     last_error = ""
     usage_totals: Counter = Counter()
+    rejected_usage: Counter = Counter()
+    error: Exception | None = None
+    failure: dict[str, Any] | None = None
+    turn = 0
     # Indexed tools are offered only when the provider built this snapshot.
     offered_index = tuple(indexed_tools.tools) if indexed_tools and (index_status or {}).get("available") else ()
     tools = MINIMAL_TOOLS + offered_index
@@ -968,141 +1035,149 @@ def run_closed_tool_llm_sample(
     read_set.update(seed_context["paths"])
     read_tokens += int(seed_context["tokens"])
 
-    for turn in range(1, max_model_turns + 1):
-        prompt = build_closed_tool_prompt(
-            sample=sample,
-            query_text=query_text,
-            observations=observations,
-            read_paths=read_paths,
-            tool_calls=tool_calls,
-            max_tool_calls=max_tool_calls,
-            read_tokens=read_tokens,
-            max_read_tokens=max_read_tokens,
-            final_k=final_k,
-            last_error=last_error,
-            tools=tools,
-            index_unavailable=indexed_tools is not None and not offered_index,
-        )
-        response = create_policy_response(
-            client=client, model=model, prompt=prompt, reasoning_effort=reasoning_effort
-        )
-        response_text = response_output_text(response)
-        usage = response_usage(response)
-        usage_totals.update(usage)
-        action = parse_tool_action(response_text)
-        event = {"model_turn": turn, "tool": "model_action", "raw": response_text, "parsed": action}
-        if usage:
-            event["usage"] = usage
-        trace.append(event)
-        last_error = ""
-        kind = str(action.get("action") or "").lower()
-        if kind not in tools:
-            last_error = f"Action must be one of {', '.join(tools)}."
-            observations.append(f"ERROR: {last_error}")
-            continue
-        if tool_calls >= max_tool_calls:
-            last_error = "Tool-call budget exhausted; submit from already read files."
-            observations.append(f"ERROR: {last_error}")
-            continue
-
-        if kind == "list_dir":
-            path = str(action.get("path") or "")
-            entries = list_dir(files, path)
-            tool_calls += 1
-            observation = format_list_dir_observation(path, entries)
-            observations.append(observation)
-            trace.append({"tool": "list_dir", "path": path, "entries": entries[:40]})
-            continue
-
-        if kind == "grep":
-            pattern = str(action.get("pattern") or action.get("query") or "").strip()
-            if not pattern:
-                last_error = "grep requires a non-empty pattern."
-                observations.append(f"ERROR: {last_error}")
-                continue
-            top_k = clamp_int(action.get("top_k"), default=grep_top_k, minimum=1, maximum=grep_top_k)
-            hits = grep_files(files, pattern, top_k=top_k)
-            tool_calls += 1
-            observation = format_grep_observation(pattern, hits)
-            observations.append(observation)
-            trace.append({"tool": "grep", "pattern": pattern, "hits": compact_hits(hits)})
-            continue
-
-        if kind in INDEXED_TOOLS:
-            outcome = indexed_tools.lookup(
-                kind,
-                action,
-                repo=str(sample.get("repo") or ""),
-                base_commit=str(sample.get("base_commit") or ""),
-                files=files,
+    try:
+        for turn in range(1, max_model_turns + 1):
+            prompt = build_closed_tool_prompt(
+                sample=sample,
+                query_text=query_text,
+                observations=observations,
+                read_paths=read_paths,
+                tool_calls=tool_calls,
+                max_tool_calls=max_tool_calls,
+                read_tokens=read_tokens,
+                max_read_tokens=max_read_tokens,
+                final_k=final_k,
+                last_error=last_error,
+                tools=tools,
+                index_unavailable=indexed_tools is not None and not offered_index,
             )
-            if outcome["error"]:
-                last_error = outcome["error"]
-                observations.append(f"ERROR: {last_error}")
-                continue
-            tool_calls += 1
-            observations.append(outcome["observation"])
-            trace.append(outcome["trace"])
-            continue
-
-        if kind == "read_file":
-            path = str(action.get("path") or "")
-            if path not in files:
-                last_error = f"read_file path not found: {path}"
-                observations.append(f"ERROR: {last_error}")
-                continue
-            if path in read_set:
-                last_error = f"file already read: {path}"
-                observations.append(f"ERROR: {last_error}")
-                continue
-            if read_tokens >= max_read_tokens:
-                last_error = "read token budget exhausted; submit from already read files."
-                observations.append(f"ERROR: {last_error}")
-                continue
-            text = files[path]
-            token_count = count_tokens(text)
-            included_tokens = min(token_count, max_read_tokens - read_tokens, max_read_tokens_per_file)
-            if included_tokens <= 0:
-                last_error = "read token budget exhausted; submit from already read files."
-                observations.append(f"ERROR: {last_error}")
-                continue
-            read_tokens += included_tokens
-            tool_calls += 1
-            read_set.add(path)
-            read_paths.append(path)
-            read_steps.append(
-                {
-                    "step": tool_calls,
-                    "tool": "read_file",
-                    "path": path,
-                    "start_line": None,
-                    "end_line": None,
-                    "kind": "file",
-                    "symbol": "",
-                    "content_hash": "",
-                    "is_final_context": False,
-                    "is_utilized_context": False,
-                }
+            response = create_policy_response(
+                client=client, model=model, prompt=prompt, reasoning_effort=reasoning_effort
             )
-            observation = format_read_file_observation(path, text, included_tokens)
-            observations.append(observation)
-            trace.append({"tool": "read_file", "path": path, "tokens": included_tokens, "truncated": token_count > included_tokens})
-            continue
+            response_text = response_output_text(response)
+            usage = response_usage(response)
+            usage_totals.update(usage)
+            action = parse_tool_action(response_text)
+            event = {"model_turn": turn, "tool": "model_action", "raw": response_text, "parsed": action}
+            if usage:
+                event["usage"] = usage
+            trace.append(event)
+            last_error = ""
+            kind = str(action.get("action") or "").lower()
+            if kind not in tools:
+                last_error = f"Action must be one of {', '.join(tools)}."
+                observations.append(f"ERROR: {last_error}")
+                continue
+            if tool_calls >= max_tool_calls:
+                last_error = "Tool-call budget exhausted; submit from already read files."
+                observations.append(f"ERROR: {last_error}")
+                continue
 
-        requested = dedupe(str(path) for path in (action.get("files") or action.get("context_files") or []) if path)
-        final_files = [path for path in requested if path in read_set][:final_k]
-        if require_read_submit and not final_files:
-            last_error = "submit files must already be read with read_file; read the files you want to submit first."
-            observations.append(f"ERROR: {last_error}")
-            trace.append({"tool": "rejected_submit", "raw_files": requested})
-            continue
-        if not final_files and read_paths:
-            final_files = read_paths[:final_k]
-        tool_calls += 1
-        trace.append({"tool": "submit", "files": final_files, "raw_files": requested})
-        break
+            if kind == "list_dir":
+                path = str(action.get("path") or "")
+                entries = list_dir(files, path)
+                tool_calls += 1
+                observation = format_list_dir_observation(path, entries)
+                observations.append(observation)
+                trace.append({"tool": "list_dir", "path": path, "entries": entries[:40]})
+                continue
 
-    if not final_files:
+            if kind == "grep":
+                pattern = str(action.get("pattern") or action.get("query") or "").strip()
+                if not pattern:
+                    last_error = "grep requires a non-empty pattern."
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                top_k = clamp_int(action.get("top_k"), default=grep_top_k, minimum=1, maximum=grep_top_k)
+                hits = grep_files(files, pattern, top_k=top_k)
+                tool_calls += 1
+                observation = format_grep_observation(pattern, hits)
+                observations.append(observation)
+                trace.append({"tool": "grep", "pattern": pattern, "hits": compact_hits(hits)})
+                continue
+
+            if kind in INDEXED_TOOLS:
+                outcome = indexed_tools.lookup(
+                    kind,
+                    action,
+                    repo=str(sample.get("repo") or ""),
+                    base_commit=str(sample.get("base_commit") or ""),
+                    files=files,
+                )
+                if outcome["error"]:
+                    last_error = outcome["error"]
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                tool_calls += 1
+                observations.append(outcome["observation"])
+                trace.append(outcome["trace"])
+                continue
+
+            if kind == "read_file":
+                path = str(action.get("path") or "")
+                if path not in files:
+                    last_error = f"read_file path not found: {path}"
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                if path in read_set:
+                    last_error = f"file already read: {path}"
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                if read_tokens >= max_read_tokens:
+                    last_error = "read token budget exhausted; submit from already read files."
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                text = files[path]
+                token_count = count_tokens(text)
+                included_tokens = min(token_count, max_read_tokens - read_tokens, max_read_tokens_per_file)
+                if included_tokens <= 0:
+                    last_error = "read token budget exhausted; submit from already read files."
+                    observations.append(f"ERROR: {last_error}")
+                    continue
+                read_tokens += included_tokens
+                tool_calls += 1
+                read_set.add(path)
+                read_paths.append(path)
+                read_steps.append(
+                    {
+                        "step": tool_calls,
+                        "tool": "read_file",
+                        "path": path,
+                        "start_line": None,
+                        "end_line": None,
+                        "kind": "file",
+                        "symbol": "",
+                        "content_hash": "",
+                        "is_final_context": False,
+                        "is_utilized_context": False,
+                    }
+                )
+                observation = format_read_file_observation(path, text, included_tokens)
+                observations.append(observation)
+                trace.append({"tool": "read_file", "path": path, "tokens": included_tokens, "truncated": token_count > included_tokens})
+                continue
+
+            requested = dedupe(str(path) for path in (action.get("files") or action.get("context_files") or []) if path)
+            final_files = [path for path in requested if path in read_set][:final_k]
+            if require_read_submit and not final_files:
+                last_error = "submit files must already be read with read_file; read the files you want to submit first."
+                observations.append(f"ERROR: {last_error}")
+                rejected_usage.update(usage)
+                trace.append({"tool": "rejected_submit", "raw_files": requested, "model_turn": turn, "usage": usage})
+                continue
+            if not final_files and read_paths:
+                final_files = read_paths[:final_k]
+            tool_calls += 1
+            trace.append({"tool": "submit", "files": final_files, "raw_files": requested})
+            break
+    except Exception as exc:  # The attempt still consumed what it used so far.
+        error = exc
+        failure = {"error": type(exc).__name__, "message": str(exc)[:500], "model_turn": turn}
+
+    if failure is not None:
+        # A failed attempt scores as empty context; its costs stay recorded.
+        final_files, read_steps = [], []
+    elif not final_files:
         final_files = read_paths[:final_k]
         trace.append({"tool": "submit", "files": final_files, "fallback": True})
     final_set = set(final_files)
@@ -1143,6 +1218,7 @@ def run_closed_tool_llm_sample(
         "final_k": final_k,
         "require_read_submit": require_read_submit,
         "rejected_submits": sum(1 for item in trace if item.get("tool") == "rejected_submit"),
+        "rejected_submit_model_usage": dict(rejected_usage),
         "tool_calls": tool_calls,
         "grep_calls": sum(1 for item in trace if item.get("tool") == "grep"),
         "read_calls": sum(1 for item in trace if item.get("tool") == "read_file"),
@@ -1170,6 +1246,11 @@ def run_closed_tool_llm_sample(
             index_observation_tokens=sum(int(item.get("observation_tokens") or 0) for item in index_events),
             index_provider_errors=sum(1 for item in index_events if item.get("provider_error")),
         )
+    if error is not None:
+        detail["closed_tool"]["failure"] = failure
+        # Callers see the original exception, carrying what the attempt consumed.
+        error.partial_detail = detail
+        raise error
     return detail
 
 
@@ -1864,6 +1945,23 @@ def summarize_closed_tool_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     if any("failure" in row["closed_tool"] for row in rows):
         summary["failed_samples"] = sum(1 for row in rows if "failure" in row["closed_tool"])
+    if any(row["closed_tool"].get("require_read_submit") for row in rows):
+        summary["mean_rejected_submits"] = mean(row["closed_tool"].get("rejected_submits") or 0 for row in rows)
+        summary["rejected_submit_rate"] = mean(1.0 if row["closed_tool"].get("rejected_submits") else 0.0 for row in rows)
+        for key in ("input_tokens", "output_tokens"):
+            summary[f"mean_rejected_submit_model_{key}"] = mean(
+                (row["closed_tool"].get("rejected_submit_model_usage") or {}).get(key) or 0 for row in rows
+            )
+    attempts = [attempt for row in rows for attempt in row["closed_tool"].get("prior_attempts", [])]
+    if attempts:
+        # Retried samples report their final attempt; earlier attempts are totalled here.
+        summary["retried_samples"] = sum(1 for row in rows if row["closed_tool"].get("prior_attempts"))
+        summary["prior_attempts"] = len(attempts)
+        summary["prior_attempt_tool_calls"] = sum(attempt.get("tool_calls") or 0 for attempt in attempts)
+        for key in ("input_tokens", "output_tokens"):
+            summary[f"prior_attempt_model_{key}"] = sum(
+                (attempt.get("model_usage") or {}).get(key) or 0 for attempt in attempts
+            )
     return summary
 
 
@@ -1873,8 +1971,12 @@ def report_closed_tool_budget_curve(
     out_path: Path = DEFAULT_BUDGET_CURVE_OUT,
     markdown_out_path: Path = DEFAULT_BUDGET_CURVE_REPORT,
     budgets: Iterable[int] = (2, 4, 6, 8),
+    keep_list: Path | None = None,
 ) -> dict[str, Any]:
     details = [row for row in read_jsonl(details_path) if isinstance(row, dict)]
+    missing: list[str] = []
+    if keep_list is not None:
+        details, missing = selected_details(details, keep_list)
     budget_values = sorted({int(value) for value in budgets if int(value) > 0})
     if not budget_values:
         raise ValueError("at least one positive budget is required")
@@ -1895,9 +1997,12 @@ def report_closed_tool_budget_curve(
         "mode": "closed_tool_budget_prefix_curve",
         "details_path": str(details_path),
         "budgets": budget_values,
+        "keep_list": str(keep_list) if keep_list is not None else None,
+        "missing_selected": missing,
         "definition": (
-            "Post-hoc prefix diagnostic: for each completed closed-tool trajectory, "
+            "Post-hoc prefix diagnostic: for each closed-tool trajectory, "
             "score files read within the first B tool calls as the acquired context. "
+            "A failed attempt, or a selected sample without a trajectory, counts as empty context. "
             "This is not a counterfactual rerun with a smaller budget."
         ),
         "rows": rows,
@@ -1908,6 +2013,25 @@ def report_closed_tool_budget_curve(
     ensure_parent(markdown_out_path)
     markdown_out_path.write_text(render_budget_curve_markdown(report), encoding="utf-8")
     return report
+
+
+def selected_details(details: list[dict[str, Any]], keep_list: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Details for the frozen selection, in its order, with empty rows for missing samples."""
+    by_id = {str(row.get("sample_id") or row.get("id") or ""): row for row in details}
+    rows, missing = [], []
+    for record in read_jsonl(keep_list):
+        sample_id = str(record.get("sample_id") or "")
+        if not sample_id:
+            continue
+        if sample_id in by_id:
+            rows.append(by_id[sample_id])
+            continue
+        missing.append(sample_id)
+        sample = {"id": sample_id, **{key: record.get(key) for key in ("task_type", "repo", "base_commit")}}
+        rows.append(
+            failed_closed_tool_detail(sample, [], {"sample_id": sample_id, "error": "missing"}, policy="")
+        )
+    return rows, missing
 
 
 def closed_tool_budget_prefix_detail(detail: dict[str, Any], budget: int) -> dict[str, Any]:
@@ -1996,6 +2120,11 @@ def render_budget_curve_markdown(report: dict[str, Any]) -> str:
         f"- Generated at: `{report['generated_at']}`",
         f"- Details: `{report['details_path']}`",
         f"- Definition: {report['definition']}",
+        *(
+            [f"- Selection: `{report['keep_list']}`; samples without a trajectory: `{len(report['missing_selected'])}`"]
+            if report.get("keep_list")
+            else []
+        ),
         "",
         "## Overall",
         "",

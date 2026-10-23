@@ -46,9 +46,12 @@ The provider never receives the sample id, the query, or gold labels.
   Lookups with a missing symbol, or a `references` path that is not a released
   file, are rejected without charge, like other invalid actions.
 - Hits outside the released files are dropped and counted.
-- At most `--max-index-results` hits are shown (default 10), and hits are
-  trimmed until the observation fits `--max-index-observation-tokens` (default
-  400, counted with the charged code tokenizer).
+- At most `--max-index-results` hits are shown (default 10), and the whole
+  observation, header and status line included, fits
+  `--max-index-observation-tokens` (default 400, counted with the charged code
+  tokenizer). Long echoed arguments are shortened, then dropped, before the
+  status line would exceed the cap; hits are then trimmed from the end. A cap
+  too small for the response without echo is rejected when the run starts.
 - A provider exception is shown to the policy as a failed lookup and still
   costs the call.
 
@@ -63,12 +66,20 @@ build time is a per-snapshot cost and is reported separately from the policy
 run.
 
 With `--retain-failures`, a sample whose policy run raises scores as empty
-context, so the denominator stays the selected set. The details file keeps
-only completed trajectories, and resuming retries the failed samples.
+context, so the denominator stays the selected set, while its costs are the
+ones it actually incurred: model tokens, tool calls, read and observation
+tokens, and its index status. The details file keeps the failed attempt with
+its partial trace. Resuming retries it; the new trajectory lists the earlier
+attempts, with their costs, failures, and traces, under `prior_attempts`, and
+the summary totals them. The summary keeps one index-build record per
+snapshot, taken from the trajectories, so a resumed run still reports the
+snapshots it did not prepare again.
 
 By default, a submit that names no file already read ends the episode with
 empty context. With `--require-read-submit`, that submit is rejected without
-charge and the policy continues; each trajectory counts its rejected submits.
+charge and the policy continues. Each trajectory records its rejected submits,
+the model turn of each, and the model tokens those turns used; the summary
+reports their rate and mean tokens.
 
 ## Running arms on a frozen sample set
 
@@ -80,21 +91,40 @@ method scores and builds no index.
 
 ```bash
 TASKS="code2test comment2context edit2ripple trace2code"
-arb select-closed-tool-samples \
-  $(for t in $TASKS; do echo data/benchmark/v2_$t/samples.jsonl; done) \
-  $(for t in $TASKS; do echo --corpus data/corpus/v2_$t; done) \
+SAMPLES=$(for t in $TASKS; do echo data/benchmark/v2_$t/samples.jsonl; done)
+CORPORA=$(for t in $TASKS; do echo --corpus data/corpus/v2_$t; done)
+arb select-closed-tool-samples $SAMPLES $CORPORA \
   --per-task 15 --seed <seed> --out pilot_samples.jsonl --manifest-out pilot_manifest.json
 
-# Arm A: minimal tools. Arms B and C add --mode indexed_interactive,
-# --indexed-tools symbol_search (B) or symbol_search,references (C),
-# and --tool-provider with its options.
-arb eval-closed-tool-llm \
-  $(for t in $TASKS; do echo data/benchmark/v2_$t/samples.jsonl; done) \
-  $(for t in $TASKS; do echo --corpus data/corpus/v2_$t; done) \
-  --keep-list pilot_samples.jsonl --model <dated snapshot> --reasoning-effort none \
-  --retain-failures --out summary_A.json --details details_A.jsonl --markdown-out report_A.md
+# Shared by every arm: the frozen samples, policy, and budgets.
+COMMON="$SAMPLES $CORPORA --keep-list pilot_samples.jsonl \
+  --model <dated snapshot> --reasoning-effort none \
+  --max-tool-calls 16 --max-model-turns 20 --max-read-tokens 8000 \
+  --max-read-tokens-per-file 1200 --final-k 3 --grep-top-k 12 \
+  --retain-failures --require-read-submit"
+PROVIDER="--tool-provider <module:callable> --tool-provider-option <key=value> \
+  --max-index-results 10 --max-index-observation-tokens 400"
+
+# A: minimal tools.
+arb eval-closed-tool-llm $COMMON --mode closed_tool \
+  --out summary_A.json --details details_A.jsonl --markdown-out report_A.md
+# B: adds symbol_search.
+arb eval-closed-tool-llm $COMMON --mode indexed_interactive $PROVIDER \
+  --indexed-tools symbol_search \
+  --out summary_B.json --details details_B.jsonl --markdown-out report_B.md
+# C: adds symbol_search and references.
+arb eval-closed-tool-llm $COMMON --mode indexed_interactive $PROVIDER \
+  --indexed-tools symbol_search,references \
+  --out summary_C.json --details details_C.jsonl --markdown-out report_C.md
+
+# Tool-budget prefixes over the frozen selection, per arm.
+arb report-closed-tool-budget-curve --details details_A.jsonl --keep-list pilot_samples.jsonl \
+  --out curve_A.json --markdown-out curve_A.md
 ```
 
 Repeat `--corpus` once per samples file to pair each release with its own
 corpus. Run every arm with the same model, reasoning effort, budgets, and
-sample set.
+sample set. `--require-read-submit` and `--retain-failures` stay off unless
+given; the pilot sets both in every arm. With `--keep-list`, the prefix report
+scores every selected sample, and one without a trajectory counts as empty
+context.

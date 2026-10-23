@@ -938,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
     closed_tool_llm.add_argument("--max-index-results", type=int, default=DEFAULT_MAX_INDEX_RESULTS)
     closed_tool_llm.add_argument("--max-index-observation-tokens", type=int, default=DEFAULT_MAX_INDEX_OBSERVATION_TOKENS)
     closed_tool_llm.add_argument("--reasoning-effort", help="Responses API reasoning effort sent on every turn, for example none.")
-    closed_tool_llm.add_argument("--retain-failures", action="store_true", help="Score samples whose policy run failed as empty context instead of dropping them.")
+    closed_tool_llm.add_argument("--retain-failures", action="store_true", help="Score a failed policy run as empty context, keep it and its partial costs in the details file, and retry it on resume.")
     closed_tool_llm.add_argument("--require-read-submit", action="store_true", help="Reject, without charge, a submit that names no file already read, instead of ending the episode.")
 
     closed_tool_select = subparsers.add_parser("select-closed-tool-samples", help="Freeze a seeded per-task sample set for closed-tool runs.")
@@ -986,6 +986,11 @@ def main(argv: list[str] | None = None) -> int:
     closed_tool_budget.add_argument("--out", type=Path, default=Path("data/reports/v1_4/closed_tool_budget_curve.json"))
     closed_tool_budget.add_argument("--markdown-out", type=Path, default=Path("data/reports/v1_4/closed_tool_budget_curve.md"))
     closed_tool_budget.add_argument("--budgets", default="2,4,6,8", help="Comma-separated positive tool-call budgets.")
+    closed_tool_budget.add_argument(
+        "--keep-list",
+        type=Path,
+        help="Frozen sample selection; samples without a trajectory count as empty context.",
+    )
 
     closed_tool_intervention = subparsers.add_parser(
         "report-closed-tool-seed-intervention",
@@ -2938,6 +2943,7 @@ def main(argv: list[str] | None = None) -> int:
             out_path=args.out,
             markdown_out_path=args.markdown_out,
             budgets=budgets,
+            keep_list=args.keep_list,
         )
         print(
             json.dumps(

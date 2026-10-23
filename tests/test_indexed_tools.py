@@ -11,6 +11,7 @@ from agent_retrieval_bench.closed_tool_eval import (
     SimpleOpenAIResponse,
     closed_tool_prefix_counts,
     evaluate_closed_tool_openai,
+    report_closed_tool_budget_curve,
     run_closed_tool_llm_sample,
     select_closed_tool_samples,
 )
@@ -32,10 +33,11 @@ SAMPLE = {
 
 
 class FakeProvider:
-    def __init__(self, hits=None, available=True, error=None):
+    def __init__(self, hits=None, available=True, error=None, build=None):
         self.hits = hits if hits is not None else []
         self.available = available
         self.error = error
+        self.build = build or {"build_seconds": 1.5}
         self.calls = []
         self.prepared = []
 
@@ -44,7 +46,7 @@ class FakeProvider:
 
     def prepare(self, *, repo, base_commit, paths):
         self.prepared.append((repo, base_commit, list(paths)))
-        return {"available": self.available, "build_seconds": 1.5}
+        return {"available": self.available, **self.build}
 
     def call(self, *, tool, arguments, repo, base_commit, limit):
         self.calls.append((tool, arguments, limit))
@@ -61,9 +63,12 @@ class FakeResponses:
 
     def create(self, **kwargs):
         self.requests.append(kwargs)
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
         if self.usage is None:
-            return SimpleNamespace(output_text=self.outputs.pop(0))
-        return SimpleOpenAIResponse({"output_text": self.outputs.pop(0), "usage": self.usage})
+            return SimpleNamespace(output_text=output)
+        return SimpleOpenAIResponse({"output_text": output, "usage": self.usage})
 
 
 def make_tools(provider, tools=("symbol_search", "references"), **caps):
@@ -118,6 +123,38 @@ class IndexedToolsTest(unittest.TestCase):
         )
         self.assertLessEqual(outcome["trace"]["observation_tokens"], 30)
         self.assertGreater(outcome["trace"]["omitted"], 0)
+
+    def test_the_cap_covers_headers_of_empty_failed_and_trimmed_responses(self):
+        long_path = "/".join(["a"] * 150) + ".py"
+        files = {**FILES, long_path: "x = 1\n"}
+        cases = [
+            # A long echoed symbol with no hits.
+            (FakeProvider([]), 30, "references", {"path": "src/config.py", "symbol": "名" * 120}, "(no hits)"),
+            # A long released path at the default cap.
+            (FakeProvider([]), 400, "references", {"path": long_path, "symbol": "x"}, "(no hits)"),
+            # A provider error with a long echo.
+            (FakeProvider(error=RuntimeError("down")), 30, "symbol_search", {"symbol": "名" * 120}, "(index lookup failed)"),
+            # Every hit trimmed away.
+            (
+                FakeProvider([{"path": long_path, "start_line": 1, "symbol": "名" * 100}]),
+                30, "symbol_search", {"symbol": "x"}, "omitted to fit the observation cap",
+            ),
+        ]
+        for provider, cap, tool, action, status in cases:
+            indexed = IndexedTools(provider, ["symbol_search", "references"], max_observation_tokens=cap)
+            outcome = indexed.lookup(tool, action, repo="example/repo", base_commit="abc", files=files)
+            self.assertEqual(outcome["error"], "")
+            self.assertLessEqual(closed_tool_eval.count_tokens(outcome["observation"]), cap)
+            self.assertEqual(outcome["trace"]["observation_tokens"], closed_tool_eval.count_tokens(outcome["observation"]))
+            self.assertTrue(outcome["observation"].endswith(status + ")") or status in outcome["observation"])
+        # Short arguments are still echoed in full.
+        indexed, _ = make_tools(FakeProvider([]))
+        outcome = indexed.lookup("symbol_search", {"symbol": "parse_config"}, repo="example/repo", base_commit="abc", files=FILES)
+        self.assertEqual(outcome["observation"], "OBS symbol_search symbol='parse_config'\n(no hits)")
+
+    def test_a_cap_below_the_minimal_response_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cannot hold a minimal"):
+            IndexedTools(FakeProvider(), ["references"], max_observation_tokens=5)
 
     def test_invalid_lookup_is_rejected_before_the_provider(self):
         provider = FakeProvider([])
@@ -208,12 +245,18 @@ class IndexedToolsTest(unittest.TestCase):
         default, _ = run_policy(unread_then_read)
         self.assertEqual(default["closed_tool"]["final_files"], [])
         self.assertEqual(default["closed_tool"]["tool_calls"], 1)
-        strict, responses = run_policy(unread_then_read, require_read_submit=True)
+        usage = {"input_tokens": 100, "output_tokens": 10}
+        strict, responses = run_policy(unread_then_read, require_read_submit=True, usage=usage)
         policy = strict["closed_tool"]
         self.assertEqual(policy["final_files"], ["src/config.py"])
         self.assertEqual(policy["rejected_submits"], 1)
         self.assertEqual(policy["tool_calls"], 2)
         self.assertIn("submit files must already be read", responses.requests[1]["input"])
+        # The rejected submit's model turn and tokens are recorded.
+        rejected = [event for event in policy["trace"] if event["tool"] == "rejected_submit"]
+        self.assertEqual([event["model_turn"] for event in rejected], [1])
+        self.assertEqual(policy["rejected_submit_model_usage"], usage)
+        self.assertEqual(policy["model_usage"], {"input_tokens": 300, "output_tokens": 30})
 
     def test_provider_loading_and_options(self):
         self.assertEqual(parse_provider_options(["a=1", "b=x=y"]), {"a": "1", "b": "x=y"})
@@ -277,42 +320,132 @@ class ClosedToolSelectionTest(unittest.TestCase):
 
 
 class RetainFailuresTest(unittest.TestCase):
-    def test_failed_samples_stay_in_the_scored_denominator(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            chunks = root / "chunks.jsonl"
-            chunks.write_text("".join(json.dumps({"path": path, "kind": "file", "text": text}) + "\n" for path, text in FILES.items()))
-            corpus = root / "corpus"
-            corpus.mkdir()
-            (corpus / "corpus_manifest.jsonl").write_text(
-                json.dumps({"repo": "example/repo", "base_commit": "abc", "status": "ok", "chunks_path": str(chunks)}) + "\n"
+    """Failures, resumes, and the frozen denominator, with synthetic policy and provider responses."""
+
+    USAGE = {"input_tokens": 100, "output_tokens": 10}
+    READ = '{"action":"read_file","path":"src/config.py"}'
+    SUBMIT = '{"action":"submit","files":["src/config.py"]}'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        chunks = self.root / "chunks.jsonl"
+        chunks.write_text("".join(json.dumps({"path": path, "kind": "file", "text": text}) + "\n" for path, text in FILES.items()))
+        self.corpus = self.root / "corpus"
+        self.corpus.mkdir()
+        (self.corpus / "corpus_manifest.jsonl").write_text(
+            "".join(
+                json.dumps({"repo": "example/repo", "base_commit": commit, "status": "ok", "chunks_path": str(chunks)}) + "\n"
+                for commit in ("abc", "def")
             )
-            samples = root / "samples.jsonl"
-            samples.write_text(json.dumps(SAMPLE) + "\n" + json.dumps({**SAMPLE, "id": "s2"}) + "\n")
-            real = closed_tool_eval.run_closed_tool_llm_sample
+        )
+        self.samples = self.root / "samples.jsonl"
+        self.samples.write_text(json.dumps(SAMPLE) + "\n" + json.dumps({**SAMPLE, "id": "s2", "base_commit": "def"}) + "\n")
+        self.keep_list = self.root / "selection.jsonl"
+        self.keep_list.write_text(
+            "".join(json.dumps({"sample_id": sid, "task_type": "trace2code"}) + "\n" for sid in ("s1", "s2"))
+        )
 
-            def flaky(**kwargs):
-                if kwargs["sample"]["id"] == "s2":
-                    raise RuntimeError("API unavailable")
-                kwargs["client"] = SimpleNamespace(responses=FakeResponses(
-                    ['{"action":"read_file","path":"src/config.py"}', '{"action":"submit","files":["src/config.py"]}']
-                ))
-                return real(**kwargs)
+    def tearDown(self):
+        self.tmp.cleanup()
 
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}), patch.object(closed_tool_eval, "run_closed_tool_llm_sample", flaky):
-                summary = evaluate_closed_tool_openai(
-                    sample_paths=[samples], corpus_dir=corpus, out_path=root / "summary.json",
-                    details_path=root / "details.jsonl", markdown_out_path=root / "report.md",
-                    retain_failures=True, mode="indexed_interactive",
-                    indexed_tools=IndexedTools(FakeProvider(), ["symbol_search"]),
-                )
-            self.assertEqual(summary["evaluated"], 1)
-            self.assertEqual(summary["scored"], 2)
-            self.assertEqual(summary["closed_tool_metrics"]["overall"]["failed_samples"], 1)
-            self.assertEqual(summary["metrics"]["overall"]["samples"], 2)
-            self.assertEqual(summary["index_builds"][0]["build_seconds"], 1.5)
-            self.assertEqual(summary["indexed_tools"]["provider"]["name"], "fake")
-            self.assertEqual(len((root / "details.jsonl").read_text().splitlines()), 1)
+    def run_arm(self, scripts, provider, **options):
+        """Run the indexed arm; ``scripts`` maps sample ids to policy outputs."""
+        real = closed_tool_eval.run_closed_tool_llm_sample
+
+        def scripted(**kwargs):
+            outputs = scripts[kwargs["sample"]["id"]]
+            kwargs["client"] = SimpleNamespace(responses=FakeResponses(outputs, self.USAGE))
+            return real(**kwargs)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}), patch.object(closed_tool_eval, "run_closed_tool_llm_sample", scripted):
+            return evaluate_closed_tool_openai(
+                sample_paths=[self.samples], corpus_dir=self.corpus, out_path=self.root / "summary.json",
+                details_path=self.root / "details.jsonl", markdown_out_path=self.root / "report.md",
+                retain_failures=True, mode="indexed_interactive", require_read_submit=True,
+                indexed_tools=IndexedTools(provider, ["symbol_search"]), **options,
+            )
+
+    def details(self):
+        return [json.loads(line) for line in (self.root / "details.jsonl").read_text().splitlines()]
+
+    def test_a_failed_attempt_keeps_its_costs_but_scores_empty_context(self):
+        # s1 spends two turns; s2 spends one turn, then its next request raises.
+        summary = self.run_arm(
+            {"s1": [self.READ, self.SUBMIT], "s2": [self.READ, RuntimeError("API unavailable")]}, FakeProvider()
+        )
+        self.assertEqual((summary["evaluated"], summary["scored"]), (1, 2))
+        cost = summary["closed_tool_metrics"]["overall"]
+        self.assertEqual(cost["failed_samples"], 1)
+        self.assertEqual(cost["mean_model_input_tokens"], 150)
+        self.assertEqual(cost["mean_read_calls"], 1)
+        self.assertEqual(cost["index_available_rate"], 1.0)
+        self.assertEqual(summary["metrics"]["overall"]["final_file_f1"], 0.5)
+        self.assertEqual(summary["failures"][0]["error"], "RuntimeError")
+
+        rows = self.details()
+        self.assertEqual([row["sample_id"] for row in rows], ["s1", "s2"])
+        failed = rows[1]["closed_tool"]
+        self.assertEqual(failed["failure"]["model_turn"], 2)
+        self.assertEqual(failed["model_usage"], self.USAGE)
+        self.assertEqual(failed["final_files"], [])
+        self.assertIsNone(failed["first_gold_step"])
+        self.assertEqual([event["tool"] for event in failed["trace"]], ["model_action", "read_file"])
+        self.assertTrue(failed["index_status"]["available"])
+
+        # The prefix report keeps the frozen denominator and scores the failure as empty.
+        report = report_closed_tool_budget_curve(
+            details_path=self.root / "details.jsonl", out_path=self.root / "curve.json",
+            markdown_out_path=self.root / "curve.md", budgets=[8], keep_list=self.keep_list,
+        )
+        row = report["rows"][0]
+        self.assertEqual(row["evaluated"], 2)
+        self.assertEqual(row["metrics"]["overall"]["final_file_f1"], 0.5)
+        self.assertEqual(row["closed_tool_metrics"]["overall"]["mean_read_calls"], 1)
+        self.assertEqual(report["missing_selected"], [])
+
+    def test_resuming_retries_a_failure_and_keeps_its_accounting(self):
+        self.run_arm({"s1": [self.READ, self.SUBMIT], "s2": [self.READ, RuntimeError("API unavailable")]}, FakeProvider())
+        provider = FakeProvider()
+        summary = self.run_arm({"s2": [self.READ, self.SUBMIT]}, provider)
+        self.assertEqual(summary["skipped"], {"existing": 1})
+        self.assertEqual([prepared[1] for prepared in provider.prepared], ["def"])
+        self.assertEqual((summary["evaluated"], summary["scored"]), (2, 2))
+        retried = self.details()[1]["closed_tool"]
+        self.assertNotIn("failure", retried)
+        self.assertEqual(len(retried["prior_attempts"]), 1)
+        self.assertEqual(retried["prior_attempts"][0]["model_usage"], self.USAGE)
+        self.assertEqual(retried["prior_attempts"][0]["failure"]["error"], "RuntimeError")
+        cost = summary["closed_tool_metrics"]["overall"]
+        self.assertEqual((cost["retried_samples"], cost["prior_attempts"]), (1, 1))
+        self.assertEqual(cost["prior_attempt_model_input_tokens"], 100)
+        self.assertEqual(summary["metrics"]["overall"]["final_file_f1"], 1.0)
+
+    def test_resumed_runs_keep_earlier_index_builds(self):
+        build = {"build_seconds": 2.5, "size": 99}
+        # Partial resume: the first run covers only s1's snapshot.
+        self.run_arm({"s1": [self.READ, self.SUBMIT]}, FakeProvider(build=build), limit_samples=1)
+        summary = self.run_arm({"s2": [self.READ, self.SUBMIT]}, FakeProvider(build={"build_seconds": 4.0}))
+        builds = {row["base_commit"]: row for row in summary["index_builds"]}
+        self.assertEqual(set(builds), {"abc", "def"})
+        self.assertEqual((builds["abc"]["build_seconds"], builds["abc"]["size"]), (2.5, 99))
+        self.assertEqual(builds["def"]["build_seconds"], 4.0)
+        # Fully completed resume: nothing is prepared, and the history stays.
+        provider = FakeProvider(build={"build_seconds": 9.0})
+        summary = self.run_arm({}, provider)
+        self.assertEqual(provider.prepared, [])
+        self.assertEqual({row["base_commit"]: row["build_seconds"] for row in summary["index_builds"]}, {"abc": 2.5, "def": 4.0})
+
+    def test_the_prefix_report_counts_selected_samples_without_trajectories(self):
+        self.run_arm({"s1": [self.READ, self.SUBMIT]}, FakeProvider(), limit_samples=1)
+        report = report_closed_tool_budget_curve(
+            details_path=self.root / "details.jsonl", out_path=self.root / "curve.json",
+            markdown_out_path=self.root / "curve.md", budgets=[8], keep_list=self.keep_list,
+        )
+        self.assertEqual(report["missing_selected"], ["s2"])
+        self.assertEqual(report["rows"][0]["evaluated"], 2)
+        self.assertEqual(report["rows"][0]["metrics"]["overall"]["final_file_f1"], 0.5)
+        self.assertIn("samples without a trajectory: `1`", (self.root / "curve.md").read_text())
 
 
 if __name__ == "__main__":

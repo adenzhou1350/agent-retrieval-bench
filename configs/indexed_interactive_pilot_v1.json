@@ -155,6 +155,49 @@
       ]
     }
   },
+  "execution": {
+    "command": "arb eval-closed-tool-llm <the four v2 samples files> --corpus <each release's corpus, in order>",
+    "common_flags": [
+      "--keep-list pilot_samples.jsonl",
+      "--model gpt-5.4-mini-2026-03-17",
+      "--reasoning-effort none",
+      "--max-tool-calls 16",
+      "--max-model-turns 20",
+      "--max-read-tokens 8000",
+      "--max-read-tokens-per-file 1200",
+      "--final-k 3",
+      "--grep-top-k 12",
+      "--retain-failures",
+      "--require-read-submit"
+    ],
+    "arms": {
+      "A": [
+        "--mode closed_tool"
+      ],
+      "B": [
+        "--mode indexed_interactive",
+        "--indexed-tools symbol_search",
+        "--tool-provider codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
+        "--tool-provider-option workspace=<checkout dir>",
+        "--tool-provider-option cache=<graph cache dir>",
+        "--tool-provider-option retry_failed=false",
+        "--max-index-results 10",
+        "--max-index-observation-tokens 400"
+      ],
+      "C": [
+        "--mode indexed_interactive",
+        "--indexed-tools symbol_search,references",
+        "--tool-provider codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
+        "--tool-provider-option workspace=<checkout dir>",
+        "--tool-provider-option cache=<graph cache dir>",
+        "--tool-provider-option retry_failed=false",
+        "--max-index-results 10",
+        "--max-index-observation-tokens 400"
+      ]
+    },
+    "prefix_report": "arb report-closed-tool-budget-curve --details details_<arm>.jsonl --keep-list pilot_samples.jsonl",
+    "notes": "--require-read-submit is enabled in all three arms; its default stays off for other runs."
+  },
   "provider": {
     "name": "CodeNib",
     "factory": "codenib.eval.benchmarks.agent_retrieval_bench_tools:CodeNibToolProvider",
@@ -173,6 +216,8 @@
       "read tokens",
       "observation tokens",
       "model input and output tokens",
+      "rejected submits, with their model turns and tokens",
+      "earlier attempts of retried samples (prior_attempts), totalled apart",
       "index build seconds (per snapshot, reported separately)"
     ],
     "contrasts": {
