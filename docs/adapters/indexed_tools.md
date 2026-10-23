@@ -14,6 +14,13 @@ and read tokens, so context accounting matches the minimal-tool mode. The
 minimal-tool mode (`--mode closed_tool`, the default) stays available
 unchanged.
 
+Selected sample IDs must be unique across input files. The closed-tool
+evaluators reject duplicates before dispatching a policy or changing output
+files, including identical repeated rows: IDs are the resume/cache keys, not
+weights. Check overlapping releases or repeated `--samples` arguments instead
+of silently reweighting cached trajectories. Keep-list filtering and
+`--limit-samples` are applied before this validation.
+
 ## Plugging in a provider
 
 ARB does not depend on any index library. A provider is a Python object that
