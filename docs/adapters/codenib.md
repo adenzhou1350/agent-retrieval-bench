@@ -135,9 +135,11 @@ and fingerprints of the CodeNib files that produced them:
 3a5c91ff6479bc96dcf2a84fac37e22ab82dfb78413bec29c0560ec1b7959602  docs/assets/arb_smoke.json
 ```
 
-## Not covered yet
+## Full results
 
-- A full 345-sample retrieval run with separate index and query costs.
-- Selective retrieval, line and span scores, and interactive trajectories.
-- Adapters for CodeNib's Zoekt, vector, and code-graph retrieval. A code-graph
-  adapter would be a full-source run.
+A full 345-sample run of five CodeNib methods, with index and query costs
+reported separately, is listed under [Community Results](../community_results.md#codenib).
+It used CodeNib tag `arb/2026-10-22/methods`, which adds dense, hybrid, Zoekt,
+and full-source graph-expansion methods to the BM25 route on this page.
+Selective retrieval, line and span scores, and interactive trajectories are not
+covered.

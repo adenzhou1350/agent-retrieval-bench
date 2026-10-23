@@ -161,3 +161,167 @@ The issue compared Oko with RepoMap, Lexical, and BM25 rerun locally at
 `07014c9`: 0.636 / 0.216 / 0.384, 0.494 / 0.157 / 0.265, and 0.445 / 0.152 /
 0.205 (Recall@20 / MRR / BCY@8k). That RepoMap run predates the determinism fix
 in #3 and is not comparable with a RepoMap rerun after it.
+
+## CodeNib
+
+Submitted by the CodeNib maintainers ([CodeNib](https://github.com/sysevol-ai/CodeNib),
+Apache-2.0). Discussion: [issue #2](https://github.com/eyuansu62/agent-retrieval-bench/issues/2).
+The adapter and reporting rules are described in [docs/adapters](adapters/codenib.md).
+
+CodeNib is a repository-context tool for coding agents. These are its static
+retrievers, run through its ARB adapter with no model API calls. Four use only
+the released corpus. A fifth, graph expansion, also indexes the full source at
+each `base_commit` and is reported as a separate condition.
+
+### Results, all 345 positive samples
+
+One run per method; graph expansion ran as two concurrent shards (see Cost).
+Means over all 345 samples; failures would count as zero, and there were none.
+
+| Method | Source | Recall@5 | Recall@20 | MRR | BCY@8k |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CodeNib dense | released corpus | 0.2940 | 0.5736 | 0.2425 | 0.3355 |
+| CodeNib hybrid | released corpus | 0.2804 | 0.5972 | 0.2144 | 0.3101 |
+| CodeNib Zoekt | released corpus | 0.2498 | 0.4400 | 0.1605 | 0.2569 |
+| CodeNib BM25 | released corpus | 0.1543 | 0.3889 | 0.1211 | 0.1659 |
+| CodeNib graph expansion | **full source** | 0.1543 | 0.3498 | 0.1197 | 0.1659 |
+
+All budgets:
+
+| Method | BCY@4k | BCY@8k | BCY@16k | BCY@32k | Recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CodeNib dense | 0.2278 | 0.3355 | 0.4338 | 0.5726 | 0.4086 |
+| CodeNib hybrid | 0.1746 | 0.3101 | 0.4348 | 0.5890 | 0.4169 |
+| CodeNib Zoekt | 0.1449 | 0.2569 | 0.3368 | 0.4294 | 0.3358 |
+| CodeNib BM25 | 0.0998 | 0.1659 | 0.2763 | 0.3831 | 0.2486 |
+| CodeNib graph expansion | 0.0969 | 0.1659 | 0.2671 | 0.3444 | 0.2466 |
+
+On the same machine, ARB's own BM25 (`eval-baseline --ranker bm25
+--candidate-filter all_files`) reproduced the README row exactly: 0.4452 /
+0.1520 / 0.2051 (Recall@20 / MRR / BCY@8k).
+
+Per task, Recall@5 / Recall@20 / MRR:
+
+| Task | n | dense | hybrid | Zoekt | BM25 | graph expansion |
+| --- | ---: | --- | --- | --- | --- | --- |
+| trace2code | 101 | 0.117 / 0.480 / 0.105 | 0.163 / 0.561 / 0.111 | 0.380 / 0.607 / 0.224 | 0.190 / 0.391 / 0.130 | 0.190 / 0.416 / 0.134 |
+| comment2context | 80 | 0.294 / 0.550 / 0.307 | 0.354 / 0.627 / 0.258 | 0.125 / 0.325 / 0.090 | 0.229 / 0.529 / 0.177 | 0.229 / 0.506 / 0.174 |
+| code2test | 106 | 0.399 / 0.690 / 0.331 | 0.286 / 0.607 / 0.266 | 0.170 / 0.304 / 0.129 | 0.090 / 0.299 / 0.078 | 0.090 / 0.209 / 0.073 |
+| edit2ripple | 58 | 0.409 / 0.556 / 0.232 | 0.372 / 0.601 / 0.240 | 0.342 / 0.556 / 0.204 | 0.108 / 0.356 / 0.109 | 0.108 / 0.276 / 0.105 |
+
+### Dev and held-out halves
+
+The split is the one used for Oko: `dev` when the first byte of
+`sha256(sample_id)` is even (164 samples), `heldout` otherwise (181).
+
+| Method | Split | n | Recall@5 | Recall@20 | MRR |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CodeNib dense | dev | 164 | 0.2805 | 0.5526 | 0.2340 |
+| CodeNib dense | heldout | 181 | 0.3062 | 0.5925 | 0.2502 |
+| CodeNib hybrid | dev | 164 | 0.3110 | 0.6105 | 0.2342 |
+| CodeNib hybrid | heldout | 181 | 0.2528 | 0.5852 | 0.1964 |
+| CodeNib Zoekt | dev | 164 | 0.2566 | 0.4542 | 0.1589 |
+| CodeNib Zoekt | heldout | 181 | 0.2436 | 0.4273 | 0.1619 |
+| CodeNib BM25 | dev | 164 | 0.1839 | 0.4233 | 0.1359 |
+| CodeNib BM25 | heldout | 181 | 0.1275 | 0.3577 | 0.1077 |
+| CodeNib graph expansion | dev | 164 | 0.1839 | 0.3704 | 0.1329 |
+| CodeNib graph expansion | heldout | 181 | 0.1275 | 0.3310 | 0.1077 |
+
+No method was tuned on ARB. One diagnosis used only the dev half: CodeNib's
+BM25 tokenizer does not split camelCase identifiers, and splitting them closes
+the gap to ARB's BM25 on dev (Recall@20 0.4233 → 0.4654). The BM25 row above
+is CodeNib as released, without that change
+([CodeNib #856](https://github.com/sysevol-ai/CodeNib/issues/856)).
+
+### Methods
+
+| Method | Index per snapshot | Ranking |
+| --- | --- | --- |
+| BM25 | CodeNib BM25 over every released file and symbol chunk | All chunks ranked; a file takes the rank of its first chunk |
+| Dense | Exact inner-product search over `Qwen/Qwen3-Embedding-0.6B` vectors of every chunk (512 tokens, no instruction, bfloat16) | Same first-hit file ranking |
+| Hybrid | Both of the above | File-level reciprocal rank fusion (k = 60) of the BM25 and dense file rankings |
+| Zoekt | Zoekt trigram index of every file and symbol chunk | One literal Zoekt query per code-like term in the query (file names, backticked spans, identifiers; at most 32); files ordered by matched terms, then first match |
+| Graph expansion | BM25 as above, plus a SCIP code graph of the full source | The top five BM25 files, then up to 15 released files linked to them by compiler-resolved references, then the rest in BM25 order |
+
+**Source access.** BM25, dense, hybrid, and Zoekt read the released corpus
+only. Graph expansion also builds a code graph from a depth-one checkout of
+each `base_commit`: no later commits are in the object store, and the checkout
+is reset and cleaned before every use. Its graph neighbors outside the
+released files are dropped and counted (166 in total). BCY always uses
+released text.
+
+**Query.** The released `query` object as JSON with sorted keys, which is the
+same text as `query_text_for_eval`. No truncation. No other sample field
+reaches retrieval.
+
+**Ranking.** BM25, dense, and hybrid rank every released file and symbol chunk
+and keep each file at its first chunk; graph expansion reorders the BM25
+ranking. Zoekt ranks only files that match a term. MRR uses the full ranking.
+
+**Graph coverage.** A graph was built for 190 of the 218 snapshots (290 of 345
+samples). Seventeen transformers snapshots and one diffusers snapshot hit
+CodeNib's 600-second scip-python limit, the Java indexer produced no graph for
+five spring-boot snapshots and one mockito snapshot, and two scrapy, one gin,
+and one numpy snapshot produced none; those samples are ranked by BM25. On the
+290 samples with a graph, graph expansion lowered Recall@20 by 0.047 against
+BM25 (95% bootstrap interval −0.085 to −0.007) and left MRR and BCY@8k
+unchanged. CodeNib's Go graph omits `_test.go` files, which hurts code2test.
+
+### Cost
+
+| Method | Cold index builds, all 218 snapshots | Largest index | Query median / p95 | Tool calls per sample |
+| --- | ---: | --- | --- | ---: |
+| BM25 | 437 s | 160k chunks, 13.4M tokens, in memory | 0.40 s / 11.97 s | 1 |
+| Dense | 4,035 s | 160k vectors, 665 MB, in memory | 0.15 s / 1.76 s | 1 |
+| Hybrid | 4,365 s | both of the above | 0.55 s / 11.96 s | 2 |
+| Zoekt | 1,315 s | 276 MB on disk (9.2 GB in total) | 0.67 s / 2.37 s | 14.4 |
+| Graph expansion | 22,541 s, plus 419 s fetching source | 160k vertices, 343k reference edges | 0.33 s / 9.16 s | 1.8 |
+
+No method made a model API call. Dense and hybrid ran the embedding model
+locally and embedded each distinct chunk text once per run: 0.90M of the 6.2M
+released chunks were embedded and the rest reused. Graph expansion ran as two
+concurrent shards of the same commit on disjoint snapshots.
+
+One host: Intel Xeon Gold 5416S, 64 cores, and one H100. The CPU and GPU
+methods ran at the same time on this host, which other jobs also shared, so
+treat timings as indicative.
+
+### Versions
+
+| Item | Value |
+| --- | --- |
+| Evaluator | this repository at `07014c986f3deadb1548c62b32c0ffbe6a81465d`, unmodified |
+| Dataset | the four v2 positive releases at revision `5901e1ee3aff048290db72edf9c63bc498b79ea3`; `samples.jsonl` checksums as listed for Oko above |
+| CodeNib | tag [`arb/2026-10-22/methods`](https://github.com/sysevol-ai/CodeNib/tree/arb/2026-10-22/methods) (commit `7376fe45`) |
+| Dense model | `Qwen/Qwen3-Embedding-0.6B` at revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3` |
+
+### Rescoring without running CodeNib
+
+The rankings, a receipt with every per-sample metric, and `rescore.py` are
+published as a Hugging Face dataset at a fixed revision:
+[`sysevol-ai/codenib-arb-rankings`](https://huggingface.co/datasets/sysevol-ai/codenib-arb-rankings/tree/5310148b0d10096fd8ca4d418ef0be510153cdfc).
+
+```
+941f08ef09ef456dc8580b465cb4a412e75a4db92376e739a367fbe1a883f77f  bm25_predictions.json.gz
+6469808065f512d7f65982cddc80e2df6384c1530c211fd3ea0057b4ccd54d46  dense_predictions.json.gz
+22acd331efb155d1248a172a81c19da9c5821732123667997d03dc4c9f8b1e09  graph_expansion_predictions.json.gz
+6a5e71a078d262bd9140dcd6ffa03ff1353cf584a5700fab0daace70cb29d2ac  hybrid_predictions.json.gz
+dfcd319066b2715043fa0504ee69e8a4990296af0e02a2f022916c029f7ee342  zoekt_predictions.json.gz
+```
+
+From the root of this repository, after downloading the four v2 positive
+subsets into `data/`:
+
+```bash
+hf download sysevol-ai/codenib-arb-rankings --repo-type dataset \
+  --revision 5310148b0d10096fd8ca4d418ef0be510153cdfc --local-dir codenib-arb
+(cd codenib-arb/rankings && sha256sum -c SHA256SUMS)
+python codenib-arb/rescore.py --rankings codenib-arb/rankings \
+  --expected codenib-arb/arb_full.json
+```
+
+`rescore.py` imports only this repository's evaluator. It recomputes
+Recall@5/10/20, full-ranking MRR, and canonical BCY for every method; graph
+expansion rankings are first limited to released files. It needs no CodeNib
+install, no model, and no network after the download. On `07014c9` and on
+`3942629` it reproduces all 2,760 per-sample metric cells of each method.
