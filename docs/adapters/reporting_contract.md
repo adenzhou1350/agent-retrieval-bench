@@ -6,7 +6,8 @@ This page lists what a report should state so that adapters can be compared
 with each other and with the built-in baselines.
 
 The contract covers static file rankings. Selective retrieval and interactive
-tracks are out of scope. [CodeNib](codenib.md) is a worked example.
+tracks are out of scope; index lookups inside the closed-tool loop are covered
+in [Indexed Tools](indexed_tools.md). [CodeNib](codenib.md) is a worked example.
 
 ## Source access
 

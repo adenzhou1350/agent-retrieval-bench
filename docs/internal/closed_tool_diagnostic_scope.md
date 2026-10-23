@@ -52,6 +52,7 @@ Future extension:
 
 - Treat `symbol_search`, RepoMap seed context, and embedding seed context as an `Indexed interactive` track.
 - Keep that track separate from the closed-tool minimal-tool diagnostic, because it evaluates a different system boundary.
+- `--mode indexed_interactive` adds provider-backed `symbol_search` and `references` to the same loop; see `docs/adapters/indexed_tools.md`.
 
 ### 3. No Patch-Success Link
 

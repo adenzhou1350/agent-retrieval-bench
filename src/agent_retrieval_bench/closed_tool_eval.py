@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from .baseline import (
 )
 from .bcy_curve import TOKEN_RE, count_tokens
 from .curate import filter_samples, load_keep_ids
+from .indexed_tools import INDEXED_TOOLS, TOOL_DESCRIPTIONS, TOOL_EXAMPLES, IndexedTools
 from .io import ensure_parent, read_jsonl, utc_now, write_json
 from .trajectory import summarize_trajectory_details, trajectory_detail, write_jsonl
 
@@ -43,6 +45,14 @@ DEFAULT_SEED_INTERVENTION_OUT = Path("data/reports/v1_4/closed_tool_seed_interve
 DEFAULT_SEED_INTERVENTION_REPORT = Path("data/reports/v1_4/closed_tool_seed_intervention.md")
 DEFAULT_CODEX_BIN = Path(os.environ.get("CODEX_BIN", "/home/ubuntu/.nvm/versions/node/v22.22.0/bin/codex"))
 DEFAULT_CODEX_WORK_ROOT = Path("/tmp/arb-codex-closed-tool")
+DEFAULT_SELECTION_OUT = Path("data/eval/indexed_interactive/pilot_samples.jsonl")
+DEFAULT_SELECTION_MANIFEST = Path("data/eval/indexed_interactive/pilot_samples_manifest.json")
+
+MINIMAL_TOOLS = ("list_dir", "grep", "read_file", "submit")
+CLOSED_TOOL_MODES = ("closed_tool", "indexed_interactive")
+# Sampling and output limits sent with every OpenAI policy turn.
+POLICY_TEMPERATURE = 0
+POLICY_MAX_OUTPUT_TOKENS = 700
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
 STOP_WORDS = {
@@ -220,7 +230,7 @@ def evaluate_closed_tool_grep(
 def evaluate_closed_tool_openai(
     *,
     sample_paths: Iterable[Path] = DEFAULT_SAMPLES,
-    corpus_dir: Path = DEFAULT_CORPUS_DIR,
+    corpus_dir: Path | list[Path] = DEFAULT_CORPUS_DIR,
     out_path: Path = DEFAULT_LLM_OUT,
     details_path: Path = DEFAULT_LLM_DETAILS,
     markdown_out_path: Path = DEFAULT_LLM_REPORT,
@@ -234,7 +244,16 @@ def evaluate_closed_tool_openai(
     grep_top_k: int = 12,
     max_model_turns: int | None = None,
     force: bool = False,
+    mode: str = "closed_tool",
+    indexed_tools: IndexedTools | None = None,
+    reasoning_effort: str | None = None,
+    retain_failures: bool = False,
+    require_read_submit: bool = False,
 ) -> dict[str, Any]:
+    if mode not in CLOSED_TOOL_MODES:
+        raise ValueError(f"mode must be one of {CLOSED_TOOL_MODES}")
+    if (mode == "indexed_interactive") != (indexed_tools is not None):
+        raise ValueError("indexed tools are required in indexed_interactive mode and only there")
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set on this host.")
     try:
@@ -246,11 +265,11 @@ def evaluate_closed_tool_openai(
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         )
     started = time.monotonic()
-    manifest = load_corpus_manifest(corpus_dir)
+    sample_paths = list(sample_paths)
     keep_ids = load_keep_ids(keep_list)
     samples = []
-    for sample in filter_samples(iter_samples(sample_paths), keep_ids):
-        samples.append(sample)
+    for sample, manifest in filter_sample_manifests(sample_manifests(sample_paths, corpus_dir), keep_ids):
+        samples.append((sample, manifest))
         if limit_samples and len(samples) >= limit_samples:
             break
 
@@ -259,9 +278,10 @@ def evaluate_closed_tool_openai(
     ordered_ids: list[str] = []
     skipped = Counter()
     failures: list[dict[str, Any]] = []
+    failed_details: list[dict[str, Any]] = []
     file_cache: dict[Path, dict[str, str]] = {}
     with details_handle:
-        for sample in samples:
+        for sample, manifest in samples:
             sample_id = str(sample.get("id") or "")
             if sample_id:
                 ordered_ids.append(sample_id)
@@ -284,6 +304,9 @@ def evaluate_closed_tool_openai(
             if chunks_path not in file_cache:
                 file_cache[chunks_path] = load_file_texts(chunks_path)
             files = file_cache[chunks_path]
+            index_status = None
+            if indexed_tools is not None:
+                index_status = indexed_tools.prepare(repo=corpus_key[0], base_commit=corpus_key[1], files=files)
             try:
                 detail = run_closed_tool_llm_sample(
                     sample=sample,
@@ -298,22 +321,42 @@ def evaluate_closed_tool_openai(
                     final_k=final_k,
                     grep_top_k=grep_top_k,
                     max_model_turns=max_model_turns or max_tool_calls + 4,
+                    policy=f"openai_{mode}",
+                    indexed_tools=indexed_tools,
+                    index_status=index_status,
+                    reasoning_effort=reasoning_effort,
+                    require_read_submit=require_read_submit,
                 )
                 if sample_id:
                     details_by_id[sample_id] = detail
                 append_detail_jsonl(details_handle, detail)
             except Exception as exc:
-                failures.append({"sample_id": sample_id, "error": type(exc).__name__, "message": str(exc)})
+                failure = {"sample_id": sample_id, "error": type(exc).__name__, "message": str(exc)}
+                failures.append(failure)
+                if retain_failures:
+                    failed_details.append(failed_closed_tool_detail(sample, gold_files, failure, policy=f"openai_{mode}"))
     details = [details_by_id[sample_id] for sample_id in ordered_ids if sample_id in details_by_id]
+    # Failed samples score zero in the summary; the details file keeps only
+    # completed trajectories, so resuming retries the failures.
+    scored = details + failed_details
 
+    allowed_tools = list(MINIMAL_TOOLS) + (list(indexed_tools.tools) if indexed_tools else [])
     summary = {
         "mode": "closed_tool_context_acquisition",
-        "policy": "openai_closed_tool",
+        "policy": f"openai_{mode}",
         "model": model,
-        "setting": "closed_tool",
+        "setting": mode,
         "evaluated": len(details),
+        "scored": len(scored),
+        "retain_failures": retain_failures,
         "skipped": dict(skipped),
         "failures": failures,
+        "policy_settings": {
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "temperature": POLICY_TEMPERATURE,
+            "max_output_tokens": POLICY_MAX_OUTPUT_TOKENS,
+        },
         "budget": {
             "max_tool_calls": max_tool_calls,
             "max_model_turns": max_model_turns or max_tool_calls + 4,
@@ -321,11 +364,13 @@ def evaluate_closed_tool_openai(
             "max_read_tokens_per_file": max_read_tokens_per_file,
             "final_k": final_k,
             "grep_top_k": grep_top_k,
-            "allowed_tools": ["list_dir", "grep", "read_file", "submit"],
+            "require_read_submit": require_read_submit,
+            "allowed_tools": allowed_tools,
             "forbidden": ["embedding_index", "repo_map_index", "edit", "test_execution", "network", "fix_commit"],
         },
-        "metrics": summarize_trajectory_details(details),
-        "closed_tool_metrics": summarize_closed_tool(details),
+        "metrics": summarize_trajectory_details(scored),
+        "closed_tool_metrics": summarize_closed_tool(scored),
+        "harness": {"git_commit": harness_commit()},
         "paths": {
             "summary": str(out_path),
             "details": str(details_path),
@@ -334,11 +379,167 @@ def evaluate_closed_tool_openai(
         "generated_at": utc_now(),
         "runtime_seconds": time.monotonic() - started,
     }
+    if indexed_tools is not None:
+        summary["indexed_tools"] = indexed_tools.describe()
+        # Index builds are a per-snapshot cost, reported apart from the policy run.
+        summary["index_builds"] = list(indexed_tools.snapshots.values())
     write_json(out_path, summary)
     write_jsonl(details_path, details)
     ensure_parent(markdown_out_path)
     markdown_out_path.write_text(render_markdown(summary), encoding="utf-8")
     return summary
+
+
+def sample_manifests(
+    sample_paths: list[Path], corpus_dir: Path | list[Path]
+) -> Iterable[tuple[dict[str, Any], dict[tuple[str, str], Path]]]:
+    """Pair samples with a corpus: one corpus for every file, or one per file in order."""
+    corpus_dirs = [corpus_dir] if isinstance(corpus_dir, Path) else list(corpus_dir)
+    if len(corpus_dirs) not in {1, len(sample_paths)}:
+        raise ValueError("give one corpus for all sample files or one corpus per sample file")
+    manifests = [load_corpus_manifest(path) for path in corpus_dirs]
+    for index, path in enumerate(sample_paths):
+        manifest = manifests[index if len(manifests) > 1 else 0]
+        for sample in iter_samples([path]):
+            yield sample, manifest
+
+
+def filter_sample_manifests(
+    pairs: Iterable[tuple[dict[str, Any], dict[tuple[str, str], Path]]], keep_ids: set[str] | None
+) -> Iterable[tuple[dict[str, Any], dict[tuple[str, str], Path]]]:
+    for sample, manifest in pairs:
+        if keep_ids is None or sample.get("id") in keep_ids:
+            yield sample, manifest
+
+
+def failed_closed_tool_detail(
+    sample: dict[str, Any], gold_files: list[str], failure: dict[str, Any], *, policy: str
+) -> dict[str, Any]:
+    """A zero-context trajectory that keeps a failed sample in the denominator."""
+    detail = trajectory_detail(sample, gold_files, [], supporting_files=supporting_context_files(sample))
+    detail["closed_tool"] = {
+        "policy": policy,
+        "failure": failure,
+        "tool_calls": 0,
+        "grep_calls": 0,
+        "read_calls": 0,
+        "read_tokens": 0,
+        "final_files": [],
+        "first_gold_step": None,
+        "trace": [],
+    }
+    return detail
+
+
+def select_closed_tool_samples(
+    *,
+    sample_paths: Iterable[Path],
+    corpus_dir: Path | list[Path],
+    per_task: int,
+    seed: str,
+    out_path: Path = DEFAULT_SELECTION_OUT,
+    manifest_out_path: Path = DEFAULT_SELECTION_MANIFEST,
+) -> dict[str, Any]:
+    """Freeze a per-task sample set before any policy runs.
+
+    Eligible samples are those the closed-tool runners would evaluate: they
+    have gold files, no query leakage, and a released corpus snapshot. Within
+    each task, repositories take turns in ``sha256(seed, task, repo)`` order,
+    and each turn takes the repository's next sample in ``sha256(seed, id)``
+    order, so every repository gets one sample before any gets two. The
+    selection reads no method scores and builds no index.
+    """
+    if per_task <= 0:
+        raise ValueError("per_task must be positive")
+    if not seed:
+        raise ValueError("a non-empty seed is required")
+    sample_paths = list(sample_paths)
+    eligible: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    excluded: Counter = Counter()
+    for sample, manifest in sample_manifests(sample_paths, corpus_dir):
+        task = str(sample.get("task_type") or "")
+        reason = closed_tool_exclusion(sample, manifest)
+        if reason:
+            excluded[f"{task}:{reason}"] += 1
+            continue
+        eligible[task][str(sample.get("repo") or "")].append(sample)
+
+    def order(*parts: str) -> str:
+        return hashlib.sha256("\n".join((seed, *parts)).encode("utf-8")).hexdigest()
+
+    selected: list[dict[str, Any]] = []
+    tasks = {}
+    for task in sorted(eligible):
+        queues = {
+            repo: sorted(rows, key=lambda row: order(str(row.get("id"))))
+            for repo, rows in eligible[task].items()
+        }
+        repos = sorted(queues, key=lambda repo: order(task, repo))
+        available = sum(len(rows) for rows in queues.values())
+        if available < per_task:
+            raise ValueError(f"{task} has {available} eligible samples, fewer than {per_task}")
+        chosen: list[dict[str, Any]] = []
+        while len(chosen) < per_task:
+            for repo in repos:
+                if queues[repo] and len(chosen) < per_task:
+                    chosen.append(queues[repo].pop(0))
+        selected.extend(chosen)
+        tasks[task] = {
+            "eligible": available,
+            "eligible_repos": len(repos),
+            "selected": len(chosen),
+            "selected_repos": dict(sorted(Counter(str(row.get("repo")) for row in chosen).items())),
+        }
+
+    rows = [
+        {"sample_id": row.get("id"), "task_type": row.get("task_type"), "repo": row.get("repo"), "base_commit": row.get("base_commit")}
+        for row in selected
+    ]
+    ids = sorted(str(row["sample_id"]) for row in rows)
+    manifest = {
+        "mode": "closed_tool_sample_selection",
+        "seed": seed,
+        "per_task": per_task,
+        "sample_count": len(rows),
+        "sample_ids_sha256": hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest(),
+        "definition": (
+            "Eligible: gold files, no query leakage, released corpus snapshot. Per task, repositories take "
+            "turns in sha256(seed, task, repo) order; each turn takes that repository's next sample in "
+            "sha256(seed, id) order. No method scores or index builds are read."
+        ),
+        "inputs": [
+            {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in sample_paths
+        ],
+        "tasks": tasks,
+        "excluded": dict(sorted(excluded.items())),
+        "paths": {"samples": str(out_path), "manifest": str(manifest_out_path)},
+        "generated_at": utc_now(),
+    }
+    write_jsonl(out_path, rows)
+    write_json(manifest_out_path, manifest)
+    return manifest
+
+
+def closed_tool_exclusion(sample: dict[str, Any], manifest: dict[tuple[str, str], Path]) -> str:
+    """Why the closed-tool runners would skip ``sample``, or an empty string."""
+    if not target_gold_files(sample):
+        return "no_gold"
+    if query_has_leakage(sample, query_text_for_eval(sample)):
+        return "query_leakage"
+    if (str(sample.get("repo") or ""), str(sample.get("base_commit") or "")) not in manifest:
+        return "missing_corpus"
+    return ""
+
+
+def harness_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None if result.returncode == 0 else None
 
 
 def evaluate_closed_tool_codex(
@@ -731,6 +932,10 @@ def run_closed_tool_llm_sample(
     seed_label: str = "",
     max_seed_tokens: int = 0,
     max_seed_tokens_per_file: int = 1_200,
+    indexed_tools: IndexedTools | None = None,
+    index_status: dict[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    require_read_submit: bool = False,
 ) -> dict[str, Any]:
     start = time.monotonic()
     query_payload = parse_query_payload(query_text)
@@ -743,6 +948,10 @@ def run_closed_tool_llm_sample(
     tool_calls = 0
     final_files: list[str] = []
     last_error = ""
+    usage_totals: Counter = Counter()
+    # Indexed tools are offered only when the provider built this snapshot.
+    offered_index = tuple(indexed_tools.tools) if indexed_tools and (index_status or {}).get("available") else ()
+    tools = MINIMAL_TOOLS + offered_index
     seed_context = build_seed_context(
         files=files,
         seed_files=seed_files or [],
@@ -771,14 +980,24 @@ def run_closed_tool_llm_sample(
             max_read_tokens=max_read_tokens,
             final_k=final_k,
             last_error=last_error,
+            tools=tools,
+            index_unavailable=indexed_tools is not None and not offered_index,
         )
-        response_text = call_openai(client=client, model=model, prompt=prompt)
+        response = create_policy_response(
+            client=client, model=model, prompt=prompt, reasoning_effort=reasoning_effort
+        )
+        response_text = response_output_text(response)
+        usage = response_usage(response)
+        usage_totals.update(usage)
         action = parse_tool_action(response_text)
-        trace.append({"model_turn": turn, "tool": "model_action", "raw": response_text, "parsed": action})
+        event = {"model_turn": turn, "tool": "model_action", "raw": response_text, "parsed": action}
+        if usage:
+            event["usage"] = usage
+        trace.append(event)
         last_error = ""
         kind = str(action.get("action") or "").lower()
-        if kind not in {"list_dir", "grep", "read_file", "submit"}:
-            last_error = "Action must be one of list_dir, grep, read_file, submit."
+        if kind not in tools:
+            last_error = f"Action must be one of {', '.join(tools)}."
             observations.append(f"ERROR: {last_error}")
             continue
         if tool_calls >= max_tool_calls:
@@ -807,6 +1026,23 @@ def run_closed_tool_llm_sample(
             observation = format_grep_observation(pattern, hits)
             observations.append(observation)
             trace.append({"tool": "grep", "pattern": pattern, "hits": compact_hits(hits)})
+            continue
+
+        if kind in INDEXED_TOOLS:
+            outcome = indexed_tools.lookup(
+                kind,
+                action,
+                repo=str(sample.get("repo") or ""),
+                base_commit=str(sample.get("base_commit") or ""),
+                files=files,
+            )
+            if outcome["error"]:
+                last_error = outcome["error"]
+                observations.append(f"ERROR: {last_error}")
+                continue
+            tool_calls += 1
+            observations.append(outcome["observation"])
+            trace.append(outcome["trace"])
             continue
 
         if kind == "read_file":
@@ -855,6 +1091,11 @@ def run_closed_tool_llm_sample(
 
         requested = dedupe(str(path) for path in (action.get("files") or action.get("context_files") or []) if path)
         final_files = [path for path in requested if path in read_set][:final_k]
+        if require_read_submit and not final_files:
+            last_error = "submit files must already be read with read_file; read the files you want to submit first."
+            observations.append(f"ERROR: {last_error}")
+            trace.append({"tool": "rejected_submit", "raw_files": requested})
+            continue
         if not final_files and read_paths:
             final_files = read_paths[:final_k]
         tool_calls += 1
@@ -894,12 +1135,14 @@ def run_closed_tool_llm_sample(
     detail["closed_tool"] = {
         "policy": policy,
         "model": model,
-        "allowed_tools": ["list_dir", "grep", "read_file", "submit"],
+        "allowed_tools": list(tools),
         "max_tool_calls": max_tool_calls,
         "max_model_turns": max_model_turns,
         "max_read_tokens": max_read_tokens,
         "max_read_tokens_per_file": max_read_tokens_per_file,
         "final_k": final_k,
+        "require_read_submit": require_read_submit,
+        "rejected_submits": sum(1 for item in trace if item.get("tool") == "rejected_submit"),
         "tool_calls": tool_calls,
         "grep_calls": sum(1 for item in trace if item.get("tool") == "grep"),
         "read_calls": sum(1 for item in trace if item.get("tool") == "read_file"),
@@ -913,9 +1156,20 @@ def run_closed_tool_llm_sample(
         "max_seed_tokens_per_file": max_seed_tokens_per_file,
         "final_files": final_files,
         "first_gold_step": first_gold_step(read_steps, gold_files),
+        "observation_tokens": sum(count_tokens(observation) for observation in observations),
+        "model_usage": dict(usage_totals),
         "latency_seconds": time.monotonic() - start,
         "trace": trace,
     }
+    if indexed_tools is not None:
+        index_events = [item for item in trace if item.get("tool") in INDEXED_TOOLS]
+        detail["closed_tool"].update(
+            index_status={key: value for key, value in (index_status or {}).items() if key not in {"repo", "base_commit"}},
+            index_calls=len(index_events),
+            index_calls_by_tool=dict(Counter(str(item["tool"]) for item in index_events)),
+            index_observation_tokens=sum(int(item.get("observation_tokens") or 0) for item in index_events),
+            index_provider_errors=sum(1 for item in index_events if item.get("provider_error")),
+        )
     return detail
 
 
@@ -1017,7 +1271,10 @@ def build_closed_tool_prompt(
     max_read_tokens: int,
     final_k: int,
     last_error: str,
+    tools: tuple[str, ...] = MINIMAL_TOOLS,
+    index_unavailable: bool = False,
 ) -> str:
+    indexed = [tool for tool in tools if tool in INDEXED_TOOLS]
     status = {
         "sample_id": sample.get("id"),
         "task_type": sample.get("task_type"),
@@ -1034,7 +1291,7 @@ def build_closed_tool_prompt(
     instructions = [
         "You are evaluating a closed-tool context-acquisition policy for an agentic coding benchmark.",
         "Goal: identify the repository files an agent should read next to solve the sample.",
-        "You may only use these tools: list_dir, grep, read_file, submit.",
+        f"You may only use these tools: {', '.join(tools)}.",
         "Forbidden: embedding index, repository map index, editing files, running tests, network access, fix commits, or using hidden corpus content.",
         "If you are running inside Codex CLI, do not call shell commands or inspect local files; the working directory is intentionally empty.",
         "The only repository information available to you is the QUERY and RECENT OBSERVATIONS below.",
@@ -1047,6 +1304,14 @@ def build_closed_tool_prompt(
         '{"action":"submit","path":null,"pattern":null,"query":null,"top_k":null,"files":["src/example.py","tests/test_example.py"],"context_files":[]}',
         "submit files must be selected from already_read_files. Prefer submit once you have enough evidence or the budget is nearly exhausted.",
     ]
+    if indexed:
+        instructions.append(
+            "Indexed tools return file paths and line ranges only, cost one tool call each, and need a symbol field:"
+        )
+        instructions.extend(TOOL_DESCRIPTIONS[tool] for tool in indexed)
+        instructions.extend(TOOL_EXAMPLES[tool] for tool in indexed)
+    elif index_unavailable:
+        instructions.append("Indexed tools are unavailable for this repository snapshot.")
     if last_error:
         instructions.append(f"Previous action error: {last_error}")
     return "\n".join(
@@ -1065,12 +1330,23 @@ def build_closed_tool_prompt(
     )
 
 
-def call_openai(*, client: Any, model: str, prompt: str) -> str:
+def call_openai(*, client: Any, model: str, prompt: str, reasoning_effort: str | None = None) -> str:
+    response = create_policy_response(client=client, model=model, prompt=prompt, reasoning_effort=reasoning_effort)
+    return response_output_text(response)
+
+
+def create_policy_response(*, client: Any, model: str, prompt: str, reasoning_effort: str | None = None) -> Any:
     create = client.responses.create
+    options: dict[str, Any] = {"model": model, "input": prompt, "max_output_tokens": POLICY_MAX_OUTPUT_TOKENS}
+    if reasoning_effort:
+        options["reasoning"] = {"effort": reasoning_effort}
     try:
-        response = create(model=model, input=prompt, temperature=0, max_output_tokens=700)
+        return create(temperature=POLICY_TEMPERATURE, **options)
     except TypeError:
-        response = create(model=model, input=prompt, max_output_tokens=700)
+        return create(**options)
+
+
+def response_output_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
     if isinstance(text, str):
         return text
@@ -1081,6 +1357,24 @@ def call_openai(*, client: Any, model: str, prompt: str) -> str:
             if isinstance(value, str):
                 chunks.append(value)
     return "\n".join(chunks)
+
+
+def response_usage(response: Any) -> dict[str, int]:
+    """Model token counts reported by the Responses API, if any."""
+    payload = getattr(response, "payload", None)
+    usage = payload.get("usage") if isinstance(payload, dict) else getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    if not isinstance(usage, dict):
+        dump = getattr(usage, "model_dump", None)
+        usage = dump() if callable(dump) else {}
+    counts = {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_input_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+        "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
+    }
+    return {key: value for key, value in counts.items() if isinstance(value, int)}
 
 
 class CodexActionClient:
@@ -1549,7 +1843,7 @@ def summarize_closed_tool_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return {"samples": 0}
     first_hits = [row["closed_tool"]["first_gold_step"] for row in rows if row["closed_tool"].get("first_gold_step") is not None]
     final_hits = [1.0 if any(path in set(row["gold_files"]) for path in row["closed_tool"].get("final_files", [])) else 0.0 for row in rows]
-    return {
+    summary = {
         "samples": len(rows),
         "any_gold_rate": sum(1 for row in rows if row["closed_tool"].get("first_gold_step") is not None) / len(rows),
         "final_any_gold_rate": sum(final_hits) / len(rows),
@@ -1559,6 +1853,18 @@ def summarize_closed_tool_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_read_calls": mean(row["closed_tool"].get("read_calls") for row in rows),
         "mean_read_tokens": mean(row["closed_tool"].get("read_tokens") for row in rows),
     }
+    if any("model_usage" in row["closed_tool"] for row in rows):
+        summary["mean_observation_tokens"] = mean(row["closed_tool"].get("observation_tokens") or 0 for row in rows)
+        for key in ("input_tokens", "output_tokens"):
+            summary[f"mean_model_{key}"] = mean((row["closed_tool"].get("model_usage") or {}).get(key) or 0 for row in rows)
+    if any("index_calls" in row["closed_tool"] for row in rows):
+        summary["mean_index_calls"] = mean(row["closed_tool"].get("index_calls") or 0 for row in rows)
+        summary["index_available_rate"] = mean(
+            1.0 if (row["closed_tool"].get("index_status") or {}).get("available") else 0.0 for row in rows
+        )
+    if any("failure" in row["closed_tool"] for row in rows):
+        summary["failed_samples"] = sum(1 for row in rows if "failure" in row["closed_tool"])
+    return summary
 
 
 def report_closed_tool_budget_curve(
@@ -1663,7 +1969,7 @@ def closed_tool_prefix_counts(detail: dict[str, Any], budget: int) -> dict[str, 
         tool = str(event.get("tool") or "")
         if tool == "model_action":
             continue
-        if tool not in {"list_dir", "grep", "read_file", "submit"}:
+        if tool not in MINIMAL_TOOLS and tool not in INDEXED_TOOLS:
             continue
         if tool_calls >= budget:
             break
@@ -2010,7 +2316,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"- Allowed tools: `{', '.join(budget['allowed_tools'])}`",
         f"- Budget: `{budget['max_tool_calls']}` tool calls, `{budget['max_read_tokens']}` read tokens, final top-`{budget['final_k']}` files",
         policy_split,
-        "- No embedding, RepoMap, edit, test execution, network, or fix-commit access is used.",
+        (
+            "- Indexed tools come from an external provider and return locations only; "
+            "no embedding, RepoMap, edit, test execution, network, or fix-commit access is used."
+            if summary.get("indexed_tools")
+            else "- No embedding, RepoMap, edit, test execution, network, or fix-commit access is used."
+        ),
         f"- Protocol violation samples: `{summary.get('protocol_violation_samples', 0)}`",
         "",
         "## Final Context Metrics",
