@@ -467,6 +467,7 @@ ATTEMPT_FIELDS = (
     "index_calls_by_tool",
     "index_observation_tokens",
     "index_provider_errors",
+    "index_status",
     "latency_seconds",
     "trace",
 )
@@ -480,18 +481,24 @@ def prior_attempts(previous: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def index_builds(details: list[dict[str, Any]], snapshots: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
-    """One preparation record per snapshot: the one stored with its first
-    trajectory in sample order, else this run's, so a resume keeps the
-    records of snapshots it did not prepare again."""
-    builds: dict[tuple[str, str], dict[str, Any]] = {}
+    """One record per snapshot: its construction, else its first preparation.
+
+    Records come from each stored trajectory and its earlier attempts, then
+    from this run's preparations. The construction is the first record not
+    served from a cache, so a resume or a cached retry keeps the original
+    build cost, once.
+    """
+    records: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for detail in details:
-        status = detail.get("closed_tool", {}).get("index_status")
+        policy = detail.get("closed_tool", {})
         key = (str(detail.get("repo") or ""), str(detail.get("base_commit") or ""))
-        if isinstance(status, dict) and key not in builds:
-            builds[key] = {"repo": key[0], "base_commit": key[1], **status}
+        attempts = [attempt.get("index_status") for attempt in policy.get("prior_attempts", [])]
+        for status in [*attempts, policy.get("index_status")]:
+            if isinstance(status, dict):
+                records.setdefault(key, []).append({"repo": key[0], "base_commit": key[1], **status})
     for key, status in snapshots.items():
-        builds.setdefault(key, dict(status))
-    return list(builds.values())
+        records.setdefault(key, []).append(dict(status))
+    return [next((row for row in rows if row.get("cached") is not True), rows[0]) for rows in records.values()]
 
 
 def select_closed_tool_samples(

@@ -436,6 +436,30 @@ class RetainFailuresTest(unittest.TestCase):
         self.assertEqual(provider.prepared, [])
         self.assertEqual({row["base_commit"]: row["build_seconds"] for row in summary["index_builds"]}, {"abc": 2.5, "def": 4.0})
 
+    def test_a_cached_retry_keeps_the_cold_build_of_a_failed_attempt(self):
+        cold = {"build_seconds": 2.5, "size": 99, "cached": False}
+        cached = {"build_seconds": 0.0, "size": 99, "cached": True}
+        # Cold build, then s2's policy fails after one charged turn.
+        self.run_arm(
+            {"s1": [self.READ, self.SUBMIT], "s2": [self.READ, RuntimeError("API unavailable")]},
+            FakeProvider(build=cold),
+        )
+        # Resume with a cache hit; the retry completes.
+        summary = self.run_arm({"s2": [self.READ, self.SUBMIT]}, FakeProvider(build=cached))
+        retried = self.details()[1]["closed_tool"]
+        self.assertTrue(retried["index_status"]["cached"])
+        self.assertEqual(retried["prior_attempts"][0]["index_status"]["build_seconds"], 2.5)
+        builds = {row["base_commit"]: row for row in summary["index_builds"]}
+        self.assertEqual((builds["def"]["build_seconds"], builds["def"]["cached"]), (2.5, False))
+        # A further completed resume neither erases nor double-counts it.
+        provider = FakeProvider(build=cached)
+        summary = self.run_arm({}, provider)
+        self.assertEqual(provider.prepared, [])
+        self.assertEqual(len(summary["index_builds"]), 2)
+        self.assertEqual(
+            sum(row["build_seconds"] for row in summary["index_builds"] if row["base_commit"] == "def"), 2.5
+        )
+
     def test_the_prefix_report_counts_selected_samples_without_trajectories(self):
         self.run_arm({"s1": [self.READ, self.SUBMIT]}, FakeProvider(), limit_samples=1)
         report = report_closed_tool_budget_curve(

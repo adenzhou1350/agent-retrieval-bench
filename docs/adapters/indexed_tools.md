@@ -70,10 +70,12 @@ context, so the denominator stays the selected set, while its costs are the
 ones it actually incurred: model tokens, tool calls, read and observation
 tokens, and its index status. The details file keeps the failed attempt with
 its partial trace. Resuming retries it; the new trajectory lists the earlier
-attempts, with their costs, failures, and traces, under `prior_attempts`, and
-the summary totals them. The summary keeps one index-build record per
-snapshot, taken from the trajectories, so a resumed run still reports the
-snapshots it did not prepare again.
+attempts, with their costs, failures, traces, and index status, under
+`prior_attempts`, and the summary totals them. The summary keeps one
+index-build record per snapshot: the first record from the trajectories,
+their earlier attempts, or this run that was not served from a cache. A
+resumed run, or a retry that hits the cache, therefore reports the original
+build once.
 
 By default, a submit that names no file already read ends the episode with
 empty context. With `--require-read-submit`, that submit is rejected without
