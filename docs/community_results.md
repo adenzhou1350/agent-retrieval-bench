@@ -264,8 +264,8 @@ CodeNib's 600-second scip-python limit, the Java indexer produced no graph for
 five spring-boot snapshots and one mockito snapshot, and two scrapy, one gin,
 and one numpy snapshot produced none; those samples are ranked by BM25. On the
 290 samples with a graph, graph expansion lowered Recall@20 by 0.047 against
-BM25 (95% bootstrap interval −0.085 to −0.007) and left MRR and BCY@8k
-unchanged. CodeNib's Go graph omits `_test.go` files, which hurts code2test.
+BM25 (95% bootstrap interval −0.085 to −0.007). MRR fell by 0.002 (−0.005 to
++0.002), and BCY@8k showed no net change (−0.016 to +0.014). CodeNib's Go graph omits `_test.go` files, which hurts code2test.
 
 ### Cost
 
@@ -299,7 +299,7 @@ treat timings as indicative.
 
 The rankings, a receipt with every per-sample metric, and `rescore.py` are
 published as a Hugging Face dataset at a fixed revision:
-[`sysevol-ai/codenib-arb-rankings`](https://huggingface.co/datasets/sysevol-ai/codenib-arb-rankings/tree/5310148b0d10096fd8ca4d418ef0be510153cdfc).
+[`sysevol-ai/codenib-arb-rankings`](https://huggingface.co/datasets/sysevol-ai/codenib-arb-rankings/tree/8be160b7258a803bc7e6d21a7f3ef0f981bdd382).
 
 ```
 941f08ef09ef456dc8580b465cb4a412e75a4db92376e739a367fbe1a883f77f  bm25_predictions.json.gz
@@ -314,7 +314,7 @@ subsets into `data/`:
 
 ```bash
 hf download sysevol-ai/codenib-arb-rankings --repo-type dataset \
-  --revision 5310148b0d10096fd8ca4d418ef0be510153cdfc --local-dir codenib-arb
+  --revision 8be160b7258a803bc7e6d21a7f3ef0f981bdd382 --local-dir codenib-arb
 (cd codenib-arb/rankings && sha256sum -c SHA256SUMS)
 python codenib-arb/rescore.py --rankings codenib-arb/rankings \
   --expected codenib-arb/arb_full.json
